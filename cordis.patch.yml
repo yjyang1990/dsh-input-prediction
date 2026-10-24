@@ -1,0 +1,11 @@
+- insert:
+    - id: dsh-input-prediction
+      name: 'dsh-input-prediction'
+      config:
+        # Same switch as Codex's composer-predictions-enabled (default on).
+        enabled: true
+        # Model on the current session's provider; empty = the session's own model.
+        predictionModel: ''
+        # Optional effort id; empty = the session's effort when using the same model.
+        reasoningEffort: ''
+        maxTokens: 160

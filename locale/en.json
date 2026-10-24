@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Input Prediction",
+    "description": "After a reply finishes, suggests your next complete message in the composer. Tab accepts, Esc clears."
+  }
+}
