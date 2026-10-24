@@ -4,8 +4,11 @@
       config:
         # Same switch as Codex's composer-predictions-enabled (default on).
         enabled: true
-        # Model on the current session's provider; empty = the session's own model.
+        # Provider + model for predictions; empty = the session's own route.
+        # A model without provider uses the session provider, else the only provider offering it.
+        predictionProvider: ''
         predictionModel: ''
         # Optional effort id; empty = the session's effort when using the same model.
         reasoningEffort: ''
         maxTokens: 160
+        timeoutMs: 30000

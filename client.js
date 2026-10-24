@@ -233,9 +233,20 @@ window.__ModuleLoader__.load({
       document.head.appendChild(style);
     }
 
-    function effortsOf(groups, model) {
+    // One <select> value carries both halves of the route.
+    const ROUTE_SEP = '\u0000';
+    const routeValue = (provider, model) => (model ? `${provider || ''}${ROUTE_SEP}${model}` : '');
+    function parseRoute(value) {
+      const index = value.indexOf(ROUTE_SEP);
+      return index < 0
+        ? { predictionProvider: '', predictionModel: '' }
+        : { predictionProvider: value.slice(0, index), predictionModel: value.slice(index + 1) };
+    }
+
+    function effortsOf(groups, provider, model) {
       const seen = new Map();
       for (const group of groups) {
+        if (provider && group.id !== provider) continue;
         for (const item of group.models || []) {
           if (model && item.id !== model) continue;
           for (const effort of item.reasoning?.efforts || []) {
@@ -279,28 +290,39 @@ window.__ModuleLoader__.load({
       }
       const saved = {
         enabled: snap.value?.enabled !== false,
+        predictionProvider: snap.value?.predictionProvider || '',
         predictionModel: snap.value?.predictionModel || '',
         reasoningEffort: snap.value?.reasoningEffort || '',
         maxTokens: snap.value?.maxTokens || 160,
+        timeoutMs: snap.value?.timeoutMs || 30000,
       };
       const value = draft || saved;
       const dirty = draft !== null && JSON.stringify(draft) !== JSON.stringify(saved);
       const edit = (patch) => { setSaveState(''); setDraft({ ...value, ...patch }); };
       const disabled = !snap.writable || saveState === 'saving';
 
-      const knownModel = !value.predictionModel || groups.some((g) => (g.models || []).some((m) => m.id === value.predictionModel));
-      const efforts = effortsOf(groups, value.predictionModel);
+      const selected = routeValue(value.predictionProvider, value.predictionModel);
+      const knownModel = !selected || groups.some((g) => (g.models || []).some((m) => routeValue(g.id, m.id) === selected));
+      // Older configs saved only the model; the host matches its provider at call time.
+      const unknownLabel = value.predictionProvider
+        ? `${value.predictionProvider}/${value.predictionModel}（未在模型列表中）`
+        : `${value.predictionModel}（自动匹配 Provider）`;
+      const efforts = effortsOf(groups, value.predictionProvider, value.predictionModel);
       const knownEffort = !value.reasoningEffort || efforts.some(([id]) => id === value.reasoningEffort);
 
       const save = async () => {
         const maxTokens = Math.floor(Number(value.maxTokens));
+        const timeoutMs = Math.round(Number(value.timeoutMs));
         if (!Number.isSafeInteger(maxTokens) || maxTokens < 1) { setSaveState('invalid'); return; }
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000) { setSaveState('invalidTimeout'); return; }
         setSaveState('saving');
         const ok = await scope.mutate([
           { op: 'set', path: ['enabled'], value: value.enabled },
+          { op: 'set', path: ['predictionProvider'], value: value.predictionProvider },
           { op: 'set', path: ['predictionModel'], value: value.predictionModel },
           { op: 'set', path: ['reasoningEffort'], value: value.reasoningEffort },
           { op: 'set', path: ['maxTokens'], value: maxTokens },
+          { op: 'set', path: ['timeoutMs'], value: timeoutMs },
         ], snap.revision);
         if (ok) { setDraft(null); setSaveState('saved'); } else setSaveState('failed');
       };
@@ -308,6 +330,7 @@ window.__ModuleLoader__.load({
       const statusText = {
         saving: '正在保存…', saved: '已保存，下一次回复结束后生效。',
         failed: '保存失败，请检查后重试。', invalid: '最大输出 Token 必须是正整数。',
+        invalidTimeout: '超时时间至少为 1 秒。',
       }[saveState] || (snap.writable ? '' : '当前部署的配置为只读。');
 
       return h('div', { className: 'dship-config' },
@@ -316,16 +339,16 @@ window.__ModuleLoader__.load({
           '回复结束后显示输入预测'),
         h('label', null, '预测模型',
           h('select', {
-            value: value.predictionModel, disabled,
-            onChange: (e) => edit({ predictionModel: e.target.value, reasoningEffort: '' }),
+            value: selected, disabled,
+            onChange: (e) => edit({ ...parseRoute(e.target.value), reasoningEffort: '' }),
           },
           h('option', { value: '' }, '跟随当前会话模型'),
-          !knownModel && h('option', { value: value.predictionModel }, `${value.predictionModel}（未在模型列表中）`),
+          !knownModel && h('option', { value: selected }, unknownLabel),
           ...groups.map((group) => h('optgroup', { key: group.id, label: group.name || group.id },
-            ...(group.models || []).map((m) => h('option', { key: `${group.id}/${m.id}`, value: m.id }, m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id))))),
+            ...(group.models || []).map((m) => h('option', { key: `${group.id}/${m.id}`, value: routeValue(group.id, m.id) }, m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id))))),
           h('small', null, catalogState === 'loading' ? '正在加载模型列表…'
             : catalogState === 'error' ? '模型列表加载失败，可稍后重新打开此页。'
-              : '预测始终使用当前会话的 Provider；所选模型不在该 Provider 下时，回退到会话模型。')),
+              : '预测使用所选 Provider 和模型；该模型不可用时，回退到会话模型。')),
         h('label', null, '推理强度',
           h('select', { value: value.reasoningEffort, disabled, onChange: (e) => edit({ reasoningEffort: e.target.value }) },
             h('option', { value: '' }, '默认（同模型时沿用会话强度）'),
@@ -333,6 +356,8 @@ window.__ModuleLoader__.load({
             ...efforts.map(([id, name]) => h('option', { key: id, value: id }, name)))),
         h('label', null, '最大输出 Token',
           h('input', { type: 'number', min: 1, step: 1, value: value.maxTokens, disabled, onChange: (e) => edit({ maxTokens: e.target.value }) })),
+        h('label', null, '超时（秒）',
+          h('input', { type: 'number', min: 1, step: 1, value: Number(value.timeoutMs) / 1000, disabled, onChange: (e) => edit({ timeoutMs: Number(e.target.value) * 1000 }) })),
         h('div', { className: 'dship-actions' },
           h('button', { type: 'button', disabled: disabled || !dirty, onClick: save }, '保存'),
           dirty && h('button', { type: 'button', disabled, onClick: () => { setDraft(null); setSaveState(''); } }, '放弃'),
@@ -342,7 +367,8 @@ window.__ModuleLoader__.load({
     function ConfigSummary({ scope }) {
       const snap = useSyncExternalStore(scope.subscribe.bind(scope), () => scope.getSnapshot());
       const model = snap.value?.predictionModel;
-      return `回复结束后预测下一条消息 · 模型：${model || '跟随当前会话'}`;
+      const provider = snap.value?.predictionProvider;
+      return `回复结束后预测下一条消息 · 模型：${model ? `${provider ? `${provider}/` : ''}${model}` : '跟随当前会话'}`;
     }
 
     return {

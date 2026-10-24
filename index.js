@@ -2,10 +2,14 @@ import z from "@deepseek-ai/schemastery";
 
 const PREDICTION_PATH = "/api/dsh-input-prediction";
 const DEFAULT_MAX_TOKENS = 160;
+const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_PREDICTION_CHARS = 1200;
 const MAX_CONTEXT_MESSAGES = 80;
 const MAX_CONTEXT_CHARS = 100000;
 const RETAINED_PREDICTIONS = 128;
+// Harness also logs rules, skills, time and runtime context as user/message; only
+// real user input and compaction summaries describe what the user wants.
+const USER_CONTEXT_SOURCES = new Set(["user", "compact-checkpoint"]);
 const SUGGESTION_SCHEMA = {
   type: "object",
   properties: { suggestion: { type: ["string", "null"] } },
@@ -18,9 +22,11 @@ export const inject = ["connection", "llm", "sessions", "sessionProjections"];
 // Volatile fields are editable from the plugin page and apply without a restart.
 export const Config = z.object({
   enabled: z.boolean().default(true).volatile(),
+  predictionProvider: z.string().default("").volatile(),
   predictionModel: z.string().default("").volatile(),
   reasoningEffort: z.string().default("").volatile(),
   maxTokens: z.natural().min(1).default(DEFAULT_MAX_TOKENS).volatile(),
+  timeoutMs: z.natural().min(1).default(DEFAULT_TIMEOUT_MS).volatile(),
 });
 
 // Read a config field whether it is a volatile reference or a plain value.
@@ -29,6 +35,16 @@ function read(config, key) {
   return value && typeof value === "object" && typeof value.get === "function"
     ? value.get()
     : value;
+}
+
+function readText(config, key) {
+  const value = read(config, key);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function readPositive(config, key, fallback) {
+  const value = read(config, key);
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 // One entry per session: the prediction for its latest completed turn.
@@ -52,7 +68,8 @@ function textOfContent(content) {
 function compactMessages(messages) {
   const list = Array.isArray(messages) ? messages : [];
   const kept = list.slice(-MAX_CONTEXT_MESSAGES)
-    .filter((message) => ["system", "user", "assistant"].includes(message?.role))
+    .filter((message) => message?.role === "assistant"
+      || (message?.role === "user" && USER_CONTEXT_SOURCES.has(message.source?.kind ?? "user")))
     .map((message) => ({
       role: message?.role,
       content: Array.isArray(message?.content)
@@ -91,7 +108,11 @@ function latestCompletionSeq(session) {
     const event = events[i];
     if (endSeq === null) {
       if (event?.type === "turn/start") return null;
-      if (event?.type === "turn/end" && typeof event.seq === "number") endSeq = event.seq;
+      if (event?.type === "turn/end" && typeof event.seq === "number") {
+        // Interrupted or failed turns have no settled reply to follow up on.
+        if (event.data?.reason?.kind !== "completed") return null;
+        endSeq = event.seq;
+      }
       continue;
     }
     if (event?.type === "assistant/message") return endSeq;
@@ -142,32 +163,50 @@ function parseSuggestion(text) {
   }
 }
 
+async function offers(ctx, provider, model) {
+  const models = await ctx.llm.listModels(provider).catch(() => []);
+  return models.some((item) => item?.id === model);
+}
+
+// Explicit provider+model wins when routable. A model without a provider (older
+// configs) prefers the session provider, then the only other provider offering it.
+// Anything unresolvable falls back to the session's own route.
+async function resolveRoute(ctx, route, config) {
+  const sessionRoute = { provider: route.provider, model: route.model };
+  const model = readText(config, "predictionModel");
+  if (!model) return sessionRoute;
+  const provider = readText(config, "predictionProvider");
+  if (provider) {
+    if (await offers(ctx, provider, model)) return { provider, model };
+    ctx.logger?.warn?.(`dsh-input-prediction: ${provider}/${model} is unavailable; using the session model`);
+    return sessionRoute;
+  }
+  if (await offers(ctx, route.provider, model)) return { provider: route.provider, model };
+  const others = (ctx.llm.listProviders?.() || [])
+    .map((item) => item?.id)
+    .filter((id) => typeof id === "string" && id !== route.provider);
+  const matches = [];
+  for (const id of others) if (await offers(ctx, id, model)) matches.push(id);
+  if (matches.length === 1) return { provider: matches[0], model };
+  return sessionRoute;
+}
+
 async function generate(ctx, session, config, signal) {
   const route = session.requestHeader?.()?.config;
   if (!route?.provider || !route?.model) return "";
   const history = compactMessages(session.deriveMessages?.() || []);
   if (history.length === 0) return "";
 
-  const configuredModel = read(config, "predictionModel");
-  const predictionModel = typeof configuredModel === "string" ? configuredModel.trim() : "";
-  // The prediction always runs on the session's provider; a configured model that
-  // provider does not offer falls back to the session's own model.
-  let model = route.model;
-  if (predictionModel && predictionModel !== route.model) {
-    const offered = await ctx.llm.listModels(route.provider).catch(() => []);
-    if (offered.some((item) => item?.id === predictionModel)) model = predictionModel;
-  }
-  const rawEffort = read(config, "reasoningEffort");
-  const configuredEffort = typeof rawEffort === "string" ? rawEffort.trim() : "";
+  const { provider, model } = await resolveRoute(ctx, route, config);
+  signal.throwIfAborted();
+  const configuredEffort = readText(config, "reasoningEffort");
+  const sameModel = provider === route.provider && model === route.model;
   // Like Codex: configured prediction effort first, otherwise the thread's own effort.
-  const effort = configuredEffort || (model === route.model ? route.reasoningEffort : undefined);
-  const configuredMax = read(config, "maxTokens");
-  const maxTokens = Number.isSafeInteger(configuredMax) && configuredMax > 0
-    ? configuredMax
-    : DEFAULT_MAX_TOKENS;
+  const effort = configuredEffort || (sameModel ? route.reasoningEffort : undefined);
+  const maxTokens = readPositive(config, "maxTokens", DEFAULT_MAX_TOKENS);
 
   const call = await ctx.llm.prepareCall(
-    { provider: route.provider, model, maxTokens },
+    { provider, model, maxTokens },
     signal,
     (controls, info) => effort && info?.reasoning?.efforts?.some((item) => item.id === effort)
       ? { ...controls, reasoningEffort: effort }
@@ -217,12 +256,22 @@ function ensurePrediction(ctx, session, config) {
   predictions.set(session.id, entry);
   while (predictions.size > RETAINED_PREDICTIONS) clearSession(predictions.keys().next().value);
 
-  generate(ctx, session, config, entry.controller.signal)
+  const timeoutMs = readPositive(config, "timeoutMs", DEFAULT_TIMEOUT_MS);
+  const signal = AbortSignal.any([entry.controller.signal, AbortSignal.timeout(timeoutMs)]);
+  // Race the abort as well, so a provider that ignores the signal cannot leave
+  // the entry pending (and the composer polling) forever.
+  const aborted = new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+  Promise.race([generate(ctx, session, config, signal), aborted])
     .then((prediction) => {
       entry.prediction = prediction;
     })
     .catch((error) => {
-      if (!entry.controller.signal.aborted) {
+      if (entry.controller.signal.aborted) return;
+      if (error?.name === "TimeoutError") {
+        ctx.logger?.warn?.(`dsh-input-prediction: prediction timed out after ${timeoutMs}ms`);
+      } else {
         ctx.logger?.warn?.("dsh-input-prediction: prediction failed", error);
       }
     })
@@ -255,7 +304,9 @@ export function apply(ctx, config = {}) {
     if (!session?.id) return;
     if (event?.type === "turn/start") clearSession(session.id);
     // Live: generate as soon as the turn ends, even before the composer asks.
-    if (event?.type === "turn/end") setTimeout(() => ensurePrediction(ctx, session, config), 0);
+    if (event?.type === "turn/end" && event.data?.reason?.kind === "completed") {
+      setTimeout(() => ensurePrediction(ctx, session, config), 0);
+    }
   });
   ctx.on?.("session/removed", (session) => {
     if (session?.id) clearSession(session.id);

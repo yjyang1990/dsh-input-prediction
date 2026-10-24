@@ -10,6 +10,9 @@
     "url": "git+https://github.com/yjyang1990/dsh-input-prediction.git"
   },
   "homepage": "https://github.com/yjyang1990/dsh-input-prediction#readme",
+  "scripts": {
+    "test": "node --test test/"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
