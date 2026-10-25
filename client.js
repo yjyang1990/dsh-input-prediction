@@ -3,10 +3,13 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
-    const { useEffect, useRef, useState, useSyncExternalStore } = React;
+    const { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } = React;
     const PREDICTION_PATH = '/api/dsh-input-prediction';
     const POLL_MS = 600;
     const DRAFT_MS = 150;
+    // Longer predictions are clamped; the composer grows to fit what is shown.
+    const MAX_LINES = 6;
+    const HEIGHT_VAR = '--dship-ghost-height';
     // Enter is left alone: in an empty composer it usually means "send", and
     // accepting a whole prediction there is a frequent accident.
     const ACCEPT_KEYS = new Set(['Tab', 'ArrowRight']);
@@ -15,16 +18,28 @@ window.__ModuleLoader__.load({
 
     const STYLE = `
       .dship-anchor { display: none; }
+      /* top/left/right are measured from the editor, so the ghost text lines up
+         with the caret even when an accessory or attachment row sits above it. */
       .dship-prediction {
         position: absolute;
-        inset: 12px 8px auto 14px;
+        top: 12px;
+        left: 14px;
+        right: 12px;
         color: var(--dsw-alias-label-caption);
         font-family: var(--dsw-font-family);
+        font-size: inherit;
+        line-height: inherit;
         white-space: pre-wrap;
+        word-break: break-word;
         overflow-wrap: anywhere;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: ${MAX_LINES};
+        line-clamp: ${MAX_LINES};
+        overflow: hidden;
         pointer-events: none;
         user-select: none;
-        z-index: 2;
+        z-index: 1;
       }
       .dship-prediction__badge {
         display: inline-block;
@@ -36,10 +51,12 @@ window.__ModuleLoader__.load({
         font-size: 12px;
         line-height: 16px;
         white-space: nowrap;
-        vertical-align: 1px;
+        vertical-align: middle;
       }
       [data-composer-card]:has(.dship-prediction) [data-composer-placeholder] { visibility: hidden; }
       [data-composer-card]:has(.dship-prediction) [contenteditable="true"] p:last-child::after { content: none; }
+      /* Reserve room for multi-line ghost text so it never covers the toolbar row. */
+      [data-composer-card]:has(.dship-prediction) [contenteditable="true"] { min-height: var(${HEIGHT_VAR}, 36px); }
     `;
 
     function installStyle() {
@@ -64,6 +81,71 @@ window.__ModuleLoader__.load({
       return text === '';
     }
 
+    const px = (value) => Number.parseFloat(value) || 0;
+
+    // The line the caret sits on. An "empty" editor can still hold several blank
+    // paragraphs (Shift+Enter), so the caret is not necessarily on the first line.
+    function caretLine(editor) {
+      const selection = typeof window.getSelection === 'function' ? window.getSelection() : null;
+      let node = selection?.rangeCount ? selection.getRangeAt(0).startContainer : null;
+      if (node && !editor.contains(node)) node = null;
+      if (node?.nodeType === 3) node = node.parentNode;
+      while (node && node !== editor && node.parentNode !== editor) node = node.parentNode;
+      const line = node && node !== editor ? node : editor.lastElementChild;
+      return line?.getBoundingClientRect ? line : null;
+    }
+
+    // Place the ghost text exactly where the caret line starts and make the editor
+    // tall enough to hold it; undo the height reservation when it disappears.
+    function useGhostLayout(visible, anchorRef, ghostRef, text) {
+      useLayoutEffect(() => {
+        const ghost = ghostRef.current;
+        const editor = editorOf(anchorRef.current);
+        const card = anchorRef.current?.closest?.('[data-composer-card]');
+        if (!visible || !ghost || !editor || !card) return undefined;
+        let frame = 0;
+        const layout = () => {
+          frame = 0;
+          const style = getComputedStyle(editor);
+          const box = editor.getBoundingClientRect();
+          const origin = (ghost.offsetParent || card).getBoundingClientRect();
+          const line = caretLine(editor)?.getBoundingClientRect();
+          const lineTop = line && line.height > 0 ? line.top : box.top + px(style.paddingTop);
+          const left = box.left + px(style.paddingLeft);
+          ghost.style.top = `${lineTop - origin.top}px`;
+          ghost.style.left = `${left - origin.left}px`;
+          ghost.style.right = `${origin.right - (box.right - px(style.paddingRight))}px`;
+          // Height the editor needs so the whole ghost fits inside it: everything
+          // above the caret line, the ghost itself, and the bottom padding.
+          const needed = (lineTop - box.top) + ghost.getBoundingClientRect().height + px(style.paddingBottom);
+          const next = `${Math.ceil(needed)}px`;
+          if (card.style.getPropertyValue(HEIGHT_VAR) !== next) card.style.setProperty(HEIGHT_VAR, next);
+        };
+        const schedule = () => { if (!frame) frame = requestAnimationFrame(layout); };
+        layout();
+        // Attachments, accessory rows and late-loading thumbnails move the editor
+        // without resizing it, and the text area scrolls; follow all of them.
+        const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null;
+        for (const target of [card, editor, ghost, editor.parentElement]) if (target) observer?.observe(target);
+        const mutations = typeof MutationObserver === 'function' ? new MutationObserver(schedule) : null;
+        mutations?.observe(card, { childList: true, subtree: true });
+        card.addEventListener('scroll', schedule, true);
+        card.addEventListener('load', schedule, true);
+        document.addEventListener('selectionchange', schedule);
+        window.addEventListener('resize', schedule);
+        return () => {
+          if (frame) cancelAnimationFrame(frame);
+          observer?.disconnect();
+          mutations?.disconnect();
+          card.removeEventListener('scroll', schedule, true);
+          card.removeEventListener('load', schedule, true);
+          document.removeEventListener('selectionchange', schedule);
+          window.removeEventListener('resize', schedule);
+          card.style.removeProperty(HEIGHT_VAR);
+        };
+      }, [visible, text]);
+    }
+
     function triggerMenuOpen() {
       return [...document.querySelectorAll('[role="listbox"]')]
         .some((element) => element.getClientRects().length > 0);
@@ -75,6 +157,7 @@ window.__ModuleLoader__.load({
       const running = typeof useSession === 'function' ? useSession((s) => s?.running) : false;
       const busy = running === true || phase === 'adjudicating' || phase === 'submitting';
       const anchorRef = useRef(null);
+      const ghostRef = useRef(null);
       const composingRef = useRef(false);
       const [empty, setEmpty] = useState(false);
       const [composing, setComposing] = useState(false);
@@ -146,6 +229,8 @@ window.__ModuleLoader__.load({
         current && !current.dismissed && !locked && !busy && empty && !composing,
       );
 
+      useGhostLayout(visible, anchorRef, ghostRef, current?.text);
+
       useEffect(() => {
         if (!visible) return undefined;
         const onKeyDown = (event) => {
@@ -194,7 +279,7 @@ window.__ModuleLoader__.load({
         h('span', { ref: anchorRef, className: 'dship-anchor' }),
         visible && h(
           'div',
-          { className: 'dship-prediction', 'aria-hidden': true, 'data-dsh-input-prediction': true },
+          { ref: ghostRef, className: 'dship-prediction', 'aria-hidden': true, 'data-dsh-input-prediction': true },
           h('span', null, current.text),
           !hasAcceptedPrediction && h('span', { className: 'dship-prediction__badge' }, '按 Tab 接受'),
         ),
@@ -211,14 +296,14 @@ window.__ModuleLoader__.load({
       .dship-config small { color: var(--dsw-alias-label-tertiary); font-size: 12px; }
       .dship-config select, .dship-config input[type="number"], .dship-config input[type="text"] {
         height: 32px; padding: 0 8px; border-radius: 8px; font: inherit;
-        border: 1px solid var(--dsw-alias-border-primary, rgba(127,127,127,.35));
-        background: var(--dsw-alias-bg-primary, transparent); color: inherit;
+        border: 1px solid var(--dsw-alias-border-l2);
+        background: var(--dsw-alias-bg-layer-1); color: inherit;
       }
       .dship-config .dship-check { display: flex; align-items: center; gap: 8px; }
       .dship-config .dship-actions { display: flex; align-items: center; gap: 10px; }
       .dship-config button {
         height: 32px; padding: 0 14px; border-radius: 8px; border: 0; cursor: pointer; font: inherit;
-        background: var(--dsw-alias-interactive-bg-primary, #2563eb); color: var(--dsw-alias-label-on-primary, #fff);
+        background: var(--dsw-alias-brand-primary); color: #fff;
       }
       .dship-config button[disabled] { opacity: .5; cursor: default; }
       .dship-config .dship-status { color: var(--dsw-alias-label-tertiary); font-size: 12px; }
