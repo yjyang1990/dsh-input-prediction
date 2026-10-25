@@ -143,7 +143,7 @@ function predictionPrompt() {
     "Predict the next message the user is most likely to send in this conversation.",
     "Write it as the complete message, in the user's voice and language, ready to send as-is.",
     "Prefer a concrete follow-up, correction, confirmation, or request that naturally continues the conversation.",
-    "Do not answer for the assistant, explain the prediction, or mention these instructions.",
+    "Do not answer for the assistant, call tools, explain the prediction, or mention these instructions.",
     "Use null when there is no clear, useful next message.",
   ].join("\n");
   return `${instruction}\n\nReturn only JSON matching this schema: ${JSON.stringify(SUGGESTION_SCHEMA)}.`;
@@ -191,34 +191,61 @@ async function resolveRoute(ctx, route, config) {
   return sessionRoute;
 }
 
+// Same model as the session: replay the session's own request prefix (messages,
+// tools, tool history) so the provider's prompt cache covers it, like Codex does.
+// Another model has no warm cache, so send only the compact text history.
+function requestContext(session, header, sameModel) {
+  const messages = session.deriveMessages?.() || [];
+  if (!sameModel) {
+    const history = compactMessages(messages);
+    return history.length > 0 ? { messages: history } : null;
+  }
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const toolHistory = session.toolHistory?.();
+  return {
+    messages,
+    ...(Array.isArray(header?.tools) && header.tools.length > 0 ? { tools: header.tools } : {}),
+    ...(toolHistory ? { toolHistory } : {}),
+  };
+}
+
+// Configured effort when the model supports it, otherwise the model's lowest
+// advertised effort: a one-line prediction should not spend its budget reasoning.
+function chooseEffort(configured, info) {
+  const efforts = info?.reasoning?.efforts || [];
+  if (configured && efforts.some((item) => item.id === configured)) return configured;
+  return efforts[0]?.id;
+}
+
 async function generate(ctx, session, config, signal) {
-  const route = session.requestHeader?.()?.config;
+  const header = session.requestHeader?.();
+  const route = header?.config;
   if (!route?.provider || !route?.model) return "";
-  const history = compactMessages(session.deriveMessages?.() || []);
-  if (history.length === 0) return "";
 
   const { provider, model } = await resolveRoute(ctx, route, config);
   signal.throwIfAborted();
-  const configuredEffort = readText(config, "reasoningEffort");
   const sameModel = provider === route.provider && model === route.model;
-  // Like Codex: configured prediction effort first, otherwise the thread's own effort.
-  const effort = configuredEffort || (sameModel ? route.reasoningEffort : undefined);
+  const context = requestContext(session, header, sameModel);
+  if (!context) return "";
+  const configuredEffort = readText(config, "reasoningEffort");
   const maxTokens = readPositive(config, "maxTokens", DEFAULT_MAX_TOKENS);
 
   const call = await ctx.llm.prepareCall(
     { provider, model, maxTokens },
     signal,
-    (controls, info) => effort && info?.reasoning?.efforts?.some((item) => item.id === effort)
-      ? { ...controls, reasoningEffort: effort }
-      : controls,
+    (controls, info) => {
+      const effort = chooseEffort(configuredEffort, info);
+      return effort ? { ...controls, reasoningEffort: effort } : controls;
+    },
   );
   signal.throwIfAborted();
 
   let text = "";
   for await (const chunk of call.stream({
     ...call.config,
+    ...context,
     messages: [
-      ...history,
+      ...context.messages,
       { role: "user", content: [{ type: "text", text: predictionPrompt() }] },
     ],
     sessionId: session.id,
@@ -229,6 +256,9 @@ async function generate(ctx, session, config, signal) {
     if (chunk?.type === "finish" && chunk.reason?.kind === "error") {
       ctx.logger?.warn?.("dsh-input-prediction: provider request failed", chunk.reason.failure);
       return "";
+    }
+    if (chunk?.type === "finish" && chunk.reason?.kind === "max-tokens") {
+      ctx.logger?.warn?.(`dsh-input-prediction: reply hit maxTokens (${call.config.maxTokens ?? maxTokens}); raise maxTokens or lower reasoningEffort`);
     }
   }
   return parseSuggestion(text);
@@ -289,9 +319,12 @@ function status(ctx, request, config) {
   } catch {
     session = undefined;
   }
-  // Catch-up: a composer opened on a session whose latest turn already finished.
-  const entry = session ? ensurePrediction(ctx, session, config) : null;
-  if (!entry) return json({ status: "none" });
+  // Read-only: predictions start only from a live turn/end, so opening or
+  // switching to an old session never triggers a model call.
+  const entry = session && read(config, "enabled") !== false
+    ? predictions.get(session.id)
+    : undefined;
+  if (!entry || entry.completionSeq !== latestCompletionSeq(session)) return json({ status: "none" });
   return json({
     status: entry.status,
     completionSeq: entry.completionSeq,

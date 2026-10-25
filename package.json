@@ -11,7 +11,7 @@
   },
   "homepage": "https://github.com/yjyang1990/dsh-input-prediction#readme",
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "exports": {
     ".": "./index.js",

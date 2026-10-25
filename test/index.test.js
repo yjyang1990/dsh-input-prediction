@@ -34,7 +34,8 @@ function makeSession(overrides = {}) {
     ...overrides,
     snapshotEvents() { return this.events; },
     deriveMessages() { return this.messages; },
-    requestHeader() { return { config: this.route }; },
+    toolHistory() { return this.tools ? { tools: this.tools, updates: [] } : undefined; },
+    requestHeader() { return { config: this.route, ...(this.tools ? { tools: this.tools } : {}) }; },
   };
 }
 
@@ -55,13 +56,14 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
       listProviders: () => Object.keys(catalog).map((id) => ({ id })),
       listModels: async (provider) => (catalog[provider] || []).map((id) => ({ id })),
       async prepareCall(config, signal, configure) {
-        const controls = configure ? configure({}, { reasoning: { efforts: [{ id: "high" }, { id: "low" }] } }) : {};
-        const call = { config: { ...config, ...controls }, messages: undefined, signal: undefined };
+        const controls = configure ? configure({}, { reasoning: { efforts: [{ id: "off" }, { id: "low" }, { id: "high" }] } }) : {};
+        const call = { config: { ...config, ...controls }, messages: undefined, options: undefined, signal: undefined };
         calls.push(call);
         return {
           config: call.config,
           stream(options) {
             call.messages = options.messages;
+            call.options = options;
             call.signal = options.signal;
             return stream ? stream(options) : (async function* () {
               yield { type: "text-delta", text: reply };
@@ -77,6 +79,8 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
     calls,
     warnings,
     add(session) { lastSession = session.id; sessions.set(session.id, session); },
+    // A live turn/end is the only thing that starts a prediction.
+    end(session) { listeners["session/event"]?.(session, session.events.at(-1)); },
     emit: (name, ...args) => listeners[name]?.(...args),
     async poll(sessionId = lastSession) {
       const response = await route.fetch(new Request(`http://local/api/dsh-input-prediction?sessionId=${sessionId}`));
@@ -85,7 +89,10 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
   };
 }
 
-async function settle(host, sessionId) {
+async function settle(host, session) {
+  if (session) host.end(session);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const sessionId = session?.id;
   for (let i = 0; i < 100; i += 1) {
     const state = await host.poll(sessionId);
     if (state.status !== "pending") return state;
@@ -94,14 +101,14 @@ async function settle(host, sessionId) {
   throw new Error("prediction stayed pending");
 }
 
-test("sends only real user messages, summaries and assistant replies", async () => {
-  const host = makeHost();
+test("another model gets only real user messages, summaries and assistant replies", async () => {
+  const host = makeHost({ catalog: { chat: ["big", "small"] } });
   const session = makeSession();
   session.messages.splice(3, 0, userMessage("<compacted-summary>早先要求保留接口兼容</compacted-summary>", "compact-checkpoint"));
   host.add(session);
-  apply(host.ctx, {});
+  apply(host.ctx, { predictionModel: "small" });
 
-  const state = await settle(host);
+  const state = await settle(host, session);
   assert.equal(state.prediction, "继续运行测试");
   const sent = host.calls[0].messages.slice(0, -1);
   assert.deepEqual(sent.map((message) => message.content[0].text), [
@@ -113,31 +120,34 @@ test("sends only real user messages, summaries and assistant replies", async () 
 
 test("uses an explicit provider and model", async () => {
   const host = makeHost({ catalog: { chat: ["big"], responses: ["small"] } });
-  host.add(makeSession());
+  const session = makeSession();
+  host.add(session);
   apply(host.ctx, { predictionProvider: "responses", predictionModel: "small" });
 
-  await settle(host);
+  await settle(host, session);
   assert.equal(host.calls[0].config.provider, "responses");
   assert.equal(host.calls[0].config.model, "small");
   // A different model does not inherit the session's reasoning effort.
-  assert.equal(host.calls[0].config.reasoningEffort, undefined);
+  assert.equal(host.calls[0].config.reasoningEffort, "off");
 });
 
 test("finds the only provider offering a model configured without provider", async () => {
   const host = makeHost({ catalog: { chat: ["big"], responses: ["small"], other: ["x"] } });
-  host.add(makeSession());
+  const session = makeSession();
+  host.add(session);
   apply(host.ctx, { predictionModel: "small" });
 
-  await settle(host);
+  await settle(host, session);
   assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["responses", "small"]);
 });
 
 test("prefers the session provider when it offers the configured model", async () => {
   const host = makeHost({ catalog: { chat: ["big", "small"], responses: ["small"] } });
-  host.add(makeSession());
+  const session = makeSession();
+  host.add(session);
   apply(host.ctx, { predictionModel: "small" });
 
-  await settle(host);
+  await settle(host, session);
   assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["chat", "small"]);
 });
 
@@ -147,12 +157,14 @@ test("falls back to the session route when the configured model is unavailable o
     { predictionModel: "shared" },
   ]) {
     const host = makeHost({ catalog: { chat: ["big"], a: ["shared"], b: ["shared"], responses: ["small"] } });
-    host.add(makeSession());
+    const session = makeSession();
+    host.add(session);
     apply(host.ctx, config);
 
-    await settle(host);
+    await settle(host, session);
     assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["chat", "big"]);
-    assert.equal(host.calls[0].config.reasoningEffort, "high");
+    // No configured effort: the model's lowest, not the session's "high".
+    assert.equal(host.calls[0].config.reasoningEffort, "off");
   }
 });
 
@@ -186,11 +198,63 @@ test("times out a provider that never answers", async () => {
     // Ignores the abort signal on purpose.
     stream: () => (async function* () { await new Promise(() => {}); })(),
   });
-  host.add(makeSession());
+  const session = makeSession();
+  host.add(session);
   apply(host.ctx, { timeoutMs: 20 });
 
-  const state = await settle(host);
+  const state = await settle(host, session);
   assert.deepEqual([state.status, state.prediction], ["ready", ""]);
   assert.equal(host.calls[0].signal.aborted, true);
   assert.match(host.warnings.join("\n"), /timed out after 20ms/);
+});
+
+test("the session model replays the session's own request prefix for cache hits", async () => {
+  const host = makeHost();
+  const tools = [{ name: "bash", description: "run", parameters: {} }];
+  const session = makeSession({ tools });
+  host.add(session);
+  apply(host.ctx, {});
+
+  await settle(host, session);
+  const { options } = host.calls[0];
+  assert.deepEqual(options.messages.slice(0, -1), session.messages);
+  assert.deepEqual(options.tools, tools);
+  assert.deepEqual(options.toolHistory, { tools, updates: [] });
+  assert.match(options.messages.at(-1).content[0].text, /Predict the next message/);
+});
+
+test("uses a configured effort the model supports", async () => {
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, { reasoningEffort: "low" });
+
+  await settle(host, session);
+  assert.equal(host.calls[0].config.reasoningEffort, "low");
+});
+
+test("opening an old session never calls the model", async () => {
+  const host = makeHost();
+  host.add(makeSession());
+  apply(host.ctx, {});
+
+  for (let i = 0; i < 3; i += 1) assert.deepEqual(await host.poll(), { status: "none" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(host.calls.length, 0);
+});
+
+test("warns when the reply runs out of tokens", async () => {
+  const host = makeHost({
+    stream: () => (async function* () {
+      yield { type: "text-delta", text: '{"suggestion":"继' };
+      yield { type: "finish", reason: { kind: "max-tokens" } };
+    })(),
+  });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, { maxTokens: 8 });
+
+  const state = await settle(host, session);
+  assert.equal(state.prediction, "");
+  assert.match(host.warnings.join("\n"), /hit maxTokens \(8\)/);
 });

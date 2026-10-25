@@ -7,8 +7,9 @@ window.__ModuleLoader__.load({
     const PREDICTION_PATH = '/api/dsh-input-prediction';
     const POLL_MS = 600;
     const DRAFT_MS = 150;
-    // Same keys Codex accepts a prediction with; none of them sends the message.
-    const ACCEPT_KEYS = new Set(['Tab', 'ArrowRight', 'Enter']);
+    // Enter is left alone: in an empty composer it usually means "send", and
+    // accepting a whole prediction there is a frequent accident.
+    const ACCEPT_KEYS = new Set(['Tab', 'ArrowRight']);
     // Codex hides the "Press Tab" badge for good once any prediction was accepted.
     let hasAcceptedPrediction = false;
 
@@ -351,7 +352,7 @@ window.__ModuleLoader__.load({
               : '预测使用所选 Provider 和模型；该模型不可用时，回退到会话模型。')),
         h('label', null, '推理强度',
           h('select', { value: value.reasoningEffort, disabled, onChange: (e) => edit({ reasoningEffort: e.target.value }) },
-            h('option', { value: '' }, '默认（同模型时沿用会话强度）'),
+            h('option', { value: '' }, '默认（模型最低强度）'),
             !knownEffort && h('option', { value: value.reasoningEffort }, value.reasoningEffort),
             ...efforts.map(([id, name]) => h('option', { key: id, value: id }, name)))),
         h('label', null, '最大输出 Token',
