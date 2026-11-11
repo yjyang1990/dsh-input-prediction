@@ -270,11 +270,12 @@ function clearSession(sessionId) {
 }
 
 // Start (or reuse) the prediction for the session's latest completed turn.
-function ensurePrediction(ctx, session, config) {
+function ensurePrediction(ctx, session, config, retryEmpty = false) {
   const completionSeq = latestCompletionSeq(session);
   if (completionSeq === null || !eligible(ctx, session, config)) return null;
   const existing = predictions.get(session.id);
-  if (existing?.completionSeq === completionSeq) return existing;
+  if (existing?.completionSeq === completionSeq
+    && (!retryEmpty || existing.status !== "ready" || existing.prediction)) return existing;
 
   clearSession(session.id);
   const entry = {
@@ -312,15 +313,17 @@ function ensurePrediction(ctx, session, config) {
 }
 
 function status(ctx, request, config) {
-  const sessionId = new URL(request.url).searchParams.get("sessionId") || "";
+  const params = new URL(request.url).searchParams;
+  const sessionId = params.get("sessionId") || "";
   let session;
   try {
     session = sessionId ? ctx.sessions.get(sessionId) : undefined;
   } catch {
     session = undefined;
   }
-  // Read-only: predictions start only from a live turn/end, so opening or
-  // switching to an old session never triggers a model call.
+  // Ordinary polling is read-only, so opening or switching to an old session
+  // never triggers a model call. Focus-idle is an explicit live fallback.
+  if (session && params.get("trigger") === "focus-idle") ensurePrediction(ctx, session, config, true);
   const entry = session && read(config, "enabled") !== false
     ? predictions.get(session.id)
     : undefined;

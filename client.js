@@ -6,6 +6,7 @@ window.__ModuleLoader__.load({
     const { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } = React;
     const PREDICTION_PATH = '/api/dsh-input-prediction';
     const POLL_MS = 600;
+    const FOCUS_IDLE_MS = 3000;
     const DRAFT_MS = 150;
     // Longer predictions are clamped; the composer grows to fit what is shown.
     const MAX_LINES = 6;
@@ -160,7 +161,11 @@ window.__ModuleLoader__.load({
       const ghostRef = useRef(null);
       const composingRef = useRef(false);
       const [empty, setEmpty] = useState(false);
+      const [focused, setFocused] = useState(false);
+      const [inputRevision, setInputRevision] = useState(0);
       const [composing, setComposing] = useState(false);
+      const idleRequestedRef = useRef(false);
+      const idleControllerRef = useRef(null);
       // { key, text, dismissed } for the session's latest completed turn.
       const [current, setCurrent] = useState(null);
 
@@ -173,20 +178,78 @@ window.__ModuleLoader__.load({
       // Codex only shows the suggestion while the composer is empty and not composing (IME).
       useEffect(() => {
         const update = () => setEmpty(editorIsEmpty(editorOf(anchorRef.current)));
+        const onInput = () => {
+          idleRequestedRef.current = false;
+          update();
+          setInputRevision((value) => value + 1);
+        };
+        const onFocus = (event) => {
+          const editor = editorOf(anchorRef.current);
+          if (editor?.contains(event.target)) {
+            idleRequestedRef.current = false;
+            setFocused(true);
+          }
+        };
+        const onBlur = (event) => {
+          const editor = editorOf(anchorRef.current);
+          if (editor && !editor.contains(event.relatedTarget)) {
+            idleRequestedRef.current = false;
+            setFocused(false);
+          }
+        };
         update();
         const timer = setInterval(update, DRAFT_MS);
         const onStart = () => { composingRef.current = true; setComposing(true); };
         const onEnd = () => { composingRef.current = false; setComposing(false); update(); };
-        document.addEventListener('input', update, true);
+        document.addEventListener('input', onInput, true);
+        document.addEventListener('focusin', onFocus, true);
+        document.addEventListener('focusout', onBlur, true);
         document.addEventListener('compositionstart', onStart, true);
         document.addEventListener('compositionend', onEnd, true);
         return () => {
           clearInterval(timer);
-          document.removeEventListener('input', update, true);
+          document.removeEventListener('input', onInput, true);
+          document.removeEventListener('focusin', onFocus, true);
+          document.removeEventListener('focusout', onBlur, true);
           document.removeEventListener('compositionstart', onStart, true);
           document.removeEventListener('compositionend', onEnd, true);
         };
       }, []);
+
+      useEffect(() => {
+        idleRequestedRef.current = false;
+        idleControllerRef.current?.abort();
+        idleControllerRef.current = null;
+        setFocused(false);
+      }, [sessionId]);
+
+      useEffect(() => {
+        if (!busy) return;
+        idleRequestedRef.current = false;
+        idleControllerRef.current?.abort();
+        idleControllerRef.current = null;
+      }, [busy]);
+
+      // If the empty composer stays focused for three seconds, ask the backend
+      // to start the fallback only when the normal turn-end prediction is absent.
+      useEffect(() => {
+        if (!focused || !empty || composing || busy || locked || !sessionId || idleRequestedRef.current) return undefined;
+        const timer = setTimeout(() => {
+          idleRequestedRef.current = true;
+          const controller = new AbortController();
+          idleControllerRef.current = controller;
+          fetch(`${PREDICTION_PATH}?sessionId=${encodeURIComponent(sessionId)}&trigger=focus-idle`, {
+            signal: controller.signal,
+          }).catch(() => {
+            // The regular poll retries visibility; a later focus or input starts a new fallback.
+          });
+        }, FOCUS_IDLE_MS);
+        return () => {
+          clearTimeout(timer);
+          idleControllerRef.current?.abort();
+          idleControllerRef.current = null;
+        };
+      }, [sessionId, focused, empty, inputRevision, composing, busy, locked]);
 
       // Poll server state: ready after a turn completes, none once a new turn starts.
       useEffect(() => {
@@ -454,7 +517,7 @@ window.__ModuleLoader__.load({
       const snap = useSyncExternalStore(scope.subscribe.bind(scope), () => scope.getSnapshot());
       const model = snap.value?.predictionModel;
       const provider = snap.value?.predictionProvider;
-      return `回复结束后预测下一条消息 · 模型：${model ? `${provider ? `${provider}/` : ''}${model}` : '跟随当前会话'}`;
+      return `回复结束后预测下一条消息 · 空闲 3 秒补发 · 模型：${model ? `${provider ? `${provider}/` : ''}${model}` : '跟随当前会话'}`;
     }
 
     return {

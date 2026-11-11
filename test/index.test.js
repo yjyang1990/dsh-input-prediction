@@ -79,11 +79,15 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
     calls,
     warnings,
     add(session) { lastSession = session.id; sessions.set(session.id, session); },
-    // A live turn/end is the only thing that starts a prediction.
+    // A live turn/end or explicit focus-idle request starts a prediction.
     end(session) { listeners["session/event"]?.(session, session.events.at(-1)); },
     emit: (name, ...args) => listeners[name]?.(...args),
     async poll(sessionId = lastSession) {
       const response = await route.fetch(new Request(`http://local/api/dsh-input-prediction?sessionId=${sessionId}`));
+      return response.json();
+    },
+    async triggerFocusIdle(sessionId = lastSession) {
+      const response = await route.fetch(new Request(`http://local/api/dsh-input-prediction?sessionId=${sessionId}&trigger=focus-idle`));
       return response.json();
     },
   };
@@ -191,6 +195,41 @@ test("predicts as soon as a completed turn ends", async () => {
   host.emit("session/event", session, session.events.at(-1));
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(host.calls.length, 1);
+});
+
+test("starts a focus-idle fallback once and reuses the existing prediction", async () => {
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+
+  await host.triggerFocusIdle();
+  const state = await settle(host, session);
+  assert.equal(state.prediction, "继续运行测试");
+  await host.triggerFocusIdle();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(host.calls.length, 1);
+});
+
+test("retries an empty prediction on focus-idle", async () => {
+  let attempts = 0;
+  const host = makeHost({
+    stream: () => (async function* () {
+      attempts += 1;
+      yield { type: "text-delta", text: attempts === 1 ? '{"suggestion":null}' : '{"suggestion":"继续运行测试"}' };
+      yield { type: "finish", reason: { kind: "stop" } };
+    })(),
+  });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+
+  const first = await settle(host, session);
+  assert.equal(first.prediction, "");
+  await host.triggerFocusIdle();
+  const second = await settle(host, session);
+  assert.equal(second.prediction, "继续运行测试");
+  assert.equal(host.calls.length, 2);
 });
 
 test("times out a provider that never answers", async () => {
