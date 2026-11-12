@@ -44,12 +44,14 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
   const warnings = [];
   const infos = [];
   const listeners = {};
+  const cleanups = [];
   let route;
   const routes = new Map();
   let lastSession;
   const sessions = new Map();
   const ctx = {
     on(name, listener) { listeners[name] = listener; },
+    effect(setup) { cleanups.push(setup()); },
     logger: { warn: (...args) => warnings.push(args.join(" ")), info: (...args) => infos.push(args.join(" ")) },
     connection: { fetch: { register(definition) { routes.set(definition.path, definition); if (definition.path === "/api/dsh-input-prediction") route = definition; } } },
     sessions: { get: (id) => sessions.get(id) },
@@ -91,6 +93,7 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
     // A live turn/end or explicit focus-idle request starts a prediction.
     end(session) { listeners["session/event"]?.(session, session.events.at(-1)); },
     emit: (name, ...args) => listeners[name]?.(...args),
+    dispose() { for (const cleanup of cleanups) cleanup?.(); },
     async poll(sessionId = lastSession) {
       const response = await route.fetch(new Request(`http://local/api/dsh-input-prediction?sessionId=${sessionId}`));
       return response.json();
@@ -151,8 +154,39 @@ test("streams only decoded suggestion prefixes across chunk boundaries", async (
   assert.equal(state.status, "ready");
 });
 
+test("streams suggestion prefixes inside a split Markdown JSON fence", async () => {
+  let send;
+  let consumed;
+  const host = makeHost({ stream: async function* () {
+    while (true) {
+      const chunk = await new Promise((resolve) => { send = resolve; });
+      if (chunk === null) return;
+      yield { type: "text-delta", text: chunk };
+      consumed();
+    }
+  } });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx);
+  host.end(session);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (const [chunk, prediction] of [
+    ["```js", ""],
+    ["on\n{\"suggestion\":\"你", "你"],
+    ["好\\uD83D", "你好"],
+    ["\\uDE00\"}\n```", "你好😀"],
+  ]) {
+    const done = new Promise((resolve) => { consumed = resolve; });
+    send(chunk);
+    await done;
+    assert.equal((await host.poll()).prediction, prediction);
+  }
+  send(null);
+  assert.equal((await settle(host)).prediction, "你好😀");
+});
+
 test("does not expose null or unrelated JSON while pending", async () => {
-  for (const text of ['{"suggestion":null', '{"other":"secret', 'not JSON']) {
+  for (const text of ['{"suggestion":null', '{"other":"secret', 'not JSON', '```json\n{"other":"secret', 'intro\n```json\n{"suggestion":"secret']) {
     let release;
     let started;
     const received = new Promise((resolve) => { started = resolve; });
@@ -403,6 +437,33 @@ test("logs why a completed turn is skipped", async () => {
     assert.equal(host.calls.length, 0);
     assert.match(host.infos.join("\n"), new RegExp(`event=skip trigger=turn-end .*reason=${reason}|event=skip trigger=turn-end reason=${reason}`));
   }
+});
+
+test("unloading the plugin cancels scheduled and in-flight predictions without affecting another instance", async () => {
+  let started;
+  const streamStarted = new Promise((resolve) => { started = resolve; });
+  const first = makeHost({ stream: ({ signal }) => (async function* () {
+    started();
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+  })() });
+  const active = makeSession();
+  const scheduled = makeSession();
+  first.add(active);
+  first.add(scheduled);
+  apply(first.ctx);
+  first.end(active);
+  await streamStarted;
+
+  const second = makeHost();
+  second.add(active);
+  apply(second.ctx);
+  assert.equal((await settle(second, active)).prediction, "继续运行测试");
+  first.end(scheduled);
+  first.dispose();
+  assert.equal(first.calls[0].signal.aborted, true);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(first.calls.length, 1);
+  assert.equal((await second.poll(active.id)).prediction, "继续运行测试");
 });
 
 test("disposing a session cancels scheduled turn-end predictions", async () => {

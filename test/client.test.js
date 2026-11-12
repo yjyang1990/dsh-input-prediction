@@ -39,7 +39,7 @@ function createClient({ lineTop = null } = {}) {
     getBoundingClientRect: () => ({ top: 100, left: 10, right: 510 }),
     querySelector: () => null,
     contains: (target) => target === editor,
-    focus() {},
+    focus() { document.activeElement = editor; },
   };
   const properties = new Map();
   const card = {
@@ -160,7 +160,7 @@ function createClient({ lineTop = null } = {}) {
     listeners.get(type)?.({ target: editor, relatedTarget: null, ...extra });
     render();
   }
-  return { render, settle, tickPoll, advance, event, editor, requests, telemetry, logs, respond, ghost, key, styles, ghostElement, properties, get draft() { return draft; } };
+  return { render, settle, tickPoll, advance, event, editor, requests, telemetry, logs, respond, ghost, key, styles, ghostElement, properties, get draft() { return draft; }, get activeElement() { return document.activeElement; } };
 }
 
 async function focusedPending() {
@@ -373,6 +373,18 @@ test('multiline and wrapped preview uses the complete accepted text', async () =
   assert.equal(client.properties.get('--dship-ghost-height'), '224px');
   client.key('Tab');
   assert.equal(client.draft, prediction);
+});
+
+test('preview preserves editor mouse behavior and focuses when clicked', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: 'suggestion' });
+  await client.settle();
+  let prevented = false;
+  client.event('mousedown', { button: 0, preventDefault() { prevented = true; } });
+  assert.equal(prevented, false);
+  client.ghost().props.onClick();
+  assert.equal(client.activeElement, client.editor);
 });
 
 test('streams pending prefixes and accepts only the final prediction', async () => {

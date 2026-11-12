@@ -36,10 +36,10 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 | 选项 | 说明 |
 | --- | --- |
 | 回复结束后显示输入预测 | 总开关，默认开启 |
-| 预测模型 | 默认跟随当前会话；选择后同时保存 Provider 和模型，该模型不可用时回退到会话模型 |
+| 预测模型 | 默认跟随当前会话；选择后同时保存 Provider 和模型，所选路由无法解析时回退到会话模型；实际请求失败时预测为空 |
 | 推理强度 | 默认使用模型支持的最低强度（如 Off/Low），避免推理耗尽输出 Token |
 | 最大输出 Token | 默认 160 |
-| 超时（秒） | 默认 30；超时后本轮不显示预测 |
+| 超时（秒） | 默认 30；单次请求超时后无预测，满足空闲条件时仍可补发一次 |
 
 旧配置只有 `predictionModel` 而没有 `predictionProvider` 时：优先使用当前会话 Provider 下的同名模型，否则使用唯一提供该模型的 Provider；有多个 Provider 提供时回退到会话模型。
 
