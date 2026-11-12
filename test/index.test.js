@@ -697,6 +697,37 @@ test("classifies model output through the registered endpoint", async () => {
   }
 });
 
+test("logs invalid JSON structure without exposing model output", async () => {
+  const cases = [
+    ["secretprefix and secretsuffix", "missing_left_brace", null, null, false, false],
+    ['secretprefix {"suggestion":"secretsuffix', "missing_right_brace", 13, null, false, false],
+    ["  ```json\n{a}\n```  ", "parse_error", 10, 1, true, true],
+    ['{"suggestion":}', "parse_error", 0, null, false, false],
+  ];
+  for (const [reply, stage, candidateStart, errorPosition, startsWithFence, endsWithFence] of cases) {
+    const host = makeHost({ stream: () => (async function* () {
+      yield { type: "text-delta", text: reply };
+      yield { type: "finish", reason: { kind: "max-tokens" } };
+    })() });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx);
+    const state = await settle(host, session);
+    assert.equal(state.reason, "max_tokens");
+    assert.equal(state.prediction, "");
+    const line = host.infos.find((item) => item.includes("event=invalid_json "));
+    assert.ok(line);
+    const detail = JSON.parse(line.slice(line.indexOf("detail=") + 7));
+    assert.deepEqual(detail, {
+      outputChars: reply.length,
+      first: reply.trim().startsWith("```") ? "backtick" : reply.startsWith("secret") ? "letter" : "left_brace",
+      last: reply.trim().endsWith("```") ? "backtick" : reply.endsWith("}") ? "right_brace" : "letter",
+      startsWithFence, endsWithFence, stage, candidateStart, errorPosition,
+    });
+    assert.doesNotMatch([...host.infos, ...host.warnings].join("\n"), /secretprefix|secretsuffix|suggestion|```json/);
+  }
+});
+
 test("reports missing conversation context without calling the provider", async () => {
   const host = makeHost();
   const session = makeSession({ messages: [] });

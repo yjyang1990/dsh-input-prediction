@@ -67,6 +67,8 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 | `provider_error` | Provider 调用失败或中止；日志不保留原始错误详情。 |
 | `no_context` / `missing_route` | 会话没有可用上下文，或会话缺少模型路由。 |
 
+解析失败时，`event=invalid_json` 记录原始输出长度 `outputChars`、去除两端空白后的首尾字符类别 `first` / `last`、是否以代码围栏开头或结尾、失败阶段 `stage`、候选对象在原始输出中的起点 `candidateStart`，以及可识别时相对于候选对象的解析位置 `errorPosition`。长度和索引均按 JavaScript UTF-16 代码单元计；未知位置为 `null`。字符只记录固定类别，不记录原字符、正文或解析异常消息。即使触及 Token 上限覆盖最终结果，也会记录解析失败诊断。
+
 `event=route_timing`、`context_timing`、`prepare_timing` 记录路由解析、上下文构造及调用准备耗时。`event=stream_summary` 分别记录模型返回的思考和正文增量次数及字符数、首个非空增量的相对耗时 `firstReasoningMs` / `firstTextMs` 和结束事件耗时 `finishMs`；未出现为 `null`。这些流内耗时从调用流开始计算，包括网络、服务商排队及生成，不能单独区分它们；字符数不等于 Token 数，且取决于 Provider 实际返回的增量类型。
 
 前端会将加载、接口访问、后端状态、展示条件及空闲补发的状态变化回传到 Host 日志，事件名分别为 `event=client_loaded`、`client_poll`、`client_backend`、`client_display` 和 `client_idle`。浏览器 Console 中也可搜索 `[dsh-input-prediction]`。重复状态不会反复记录；回传不包含会话 ID、输入或预测文本。
