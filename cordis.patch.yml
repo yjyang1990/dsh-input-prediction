@@ -8,7 +8,9 @@
         # A model without provider uses the session provider, else the only provider offering it.
         predictionProvider: ''
         predictionModel: ''
+        # Optional one-time fallback to the session model after an eligible failure.
+        fallbackToSession: false
         # Optional effort id; empty = the model's lowest advertised effort.
         reasoningEffort: ''
-        maxTokens: 160
+        maxTokens: 2000
         timeoutMs: 30000

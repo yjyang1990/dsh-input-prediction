@@ -11,8 +11,8 @@ const adapterPath = `${dshRoot}/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/inde
 if (process.env.DSH_ROOT && !existsSync(adapterPath)) throw new Error(`DSH adapter not found: ${adapterPath}`);
 const applyPiAi = existsSync(adapterPath) ? (await import(adapterPath)).apply : null;
 
-for (const api of ["openai-completions", "openai-responses"]) {
-  test(`prediction uses the real pi-ai ${api} adapter against local HTTP`, { skip: !applyPiAi && "DSH adapter not installed; set DSH_ROOT" }, async (t) => {
+for (const [api, fallback] of [["openai-completions", false], ["openai-responses", false], ["openai-completions", true]]) {
+  test(`prediction uses the real pi-ai ${api} adapter against local HTTP${fallback ? " after missing credentials" : ""}`, { skip: !applyPiAi && "DSH adapter not installed; set DSH_ROOT" }, async (t) => {
     const requests = [];
     const suggestion = '{"suggestion":"继续运行测试"}';
     const server = createServer(async (req, res) => {
@@ -46,7 +46,7 @@ for (const api of ["openai-completions", "openai-responses"]) {
     t.after(() => { globalThis.fetch = originalFetch; });
 
     let adapter;
-    const credentials = { resolve: async () => ({ value: "fixture-key" }), readRecord: async () => undefined };
+    const credentials = { resolve: async (ref) => ref === "MISSING_FIXTURE_KEY" ? undefined : { value: "fixture-key" }, readRecord: async () => undefined };
     const adapterCtx = {
       fiber: {}, logger: { warn() {}, error() {} },
       inject() {}, on() {}, get: (name) => name === "credentials" ? credentials : undefined,
@@ -56,7 +56,10 @@ for (const api of ["openai-completions", "openai-responses"]) {
         registerAdapter(_routes, value) { adapter = value; },
       },
     };
-    applyPiAi(adapterCtx, { providers: { get: () => ({ fixture: { api, baseURL, apiKeyEnv: "FIXTURE_KEY", models: [{ id: "fixture-model" }] } }) } });
+    applyPiAi(adapterCtx, { providers: { get: () => ({
+      fixture: { api, baseURL, apiKeyEnv: "FIXTURE_KEY", models: [{ id: "fixture-model" }] },
+      missing: { api, baseURL, apiKeyEnv: "MISSING_FIXTURE_KEY", models: [{ id: "fixture-model" }] },
+    }) } });
     assert.ok(adapter, "real pi-ai adapter registered");
     const events = [
       { type: "turn/start", seq: 1 },
@@ -65,14 +68,18 @@ for (const api of ["openai-completions", "openai-responses"]) {
     ];
     const session = {
       id: `integration-${api}`, header: {}, snapshotEvents: () => events,
-      requestHeader: () => ({ config: { provider: "fixture", model: "fixture-model" } }),
+      requestHeader: () => ({ config: { provider: "fixture", model: "fixture-model" }, ...(fallback ? { tools: [{ name: "secret_tool" }] } : {}) }),
       deriveMessages: () => [
         { role: "user", content: [{ type: "text", text: "帮我修改代码" }] },
-        { role: "assistant", source: { kind: "model", provider: "fixture", model: "fixture-model" }, content: [{ type: "text", text: "已修改" }] },
+        ...(fallback ? [{ role: "tool", content: [{ type: "text", text: "secret tool output" }] }] : []),
+        { role: "assistant", source: { kind: "model", provider: "fixture", model: "fixture-model", privateMetadata: "secret metadata" }, content: [{ type: "text", text: "已修改" }] },
       ],
     };
     let route;
     const warnings = [];
+    const attempts = [];
+    const streamRequests = [];
+    const errors = [];
     const ctx = {
       effect(callback) { t.after(callback()); },
       on() {}, logger: { warn: (...args) => warnings.push(args.map((arg) => arg instanceof Error ? arg.stack : arg)) },
@@ -81,12 +88,32 @@ for (const api of ["openai-completions", "openai-responses"]) {
       llm: {
         resolveModelInfo: (provider, model) => adapter.resolveModel(provider, model),
         async prepareCall(config, signal, configure) {
-          const prepared = await adapter.prepareCall(config.provider, config.model, signal);
-          return { config: { ...config, ...configure({}, prepared.model) }, stream: prepared.stream };
+          attempts.push(config.provider);
+          try {
+            const prepared = await adapter.prepareCall(config.provider, config.model, signal);
+            return {
+              config: { ...config, ...configure({}, prepared.model) },
+              async *stream(request) {
+                streamRequests.push({ provider: config.provider, request });
+                try {
+                  for await (const chunk of prepared.stream(request)) {
+                    if (chunk.type === "finish" && chunk.reason?.failure?.code) errors.push(chunk.reason.failure.code);
+                    yield chunk;
+                  }
+                } catch (error) {
+                  errors.push(error.code);
+                  throw error;
+                }
+              },
+            };
+          } catch (error) {
+            errors.push(error.code);
+            throw error;
+          }
         },
       },
     };
-    apply(ctx, { timeoutMs: 3000, maxTokens: 160, predictionProvider: "fixture", predictionModel: "fixture-model" });
+    apply(ctx, { timeoutMs: 3000, maxTokens: 160, predictionProvider: fallback ? "missing" : "fixture", predictionModel: "fixture-model", fallbackToSession: fallback });
     const url = `http://local/api/dsh-input-prediction?sessionId=${session.id}`;
     await route.fetch(new Request(`${url}&trigger=focus-idle`));
     let state;
@@ -105,5 +132,15 @@ for (const api of ["openai-completions", "openai-responses"]) {
     assert.match(serialized, /帮我修改代码/);
     assert.match(serialized, /已修改/);
     assert.match(serialized, /Predict the next message/);
+    if (fallback) {
+      assert.deepEqual(attempts, ["missing", "fixture"]);
+      assert.deepEqual(errors, ["MISSING_CREDENTIAL"]);
+      assert.deepEqual(streamRequests.map(({ provider }) => provider), ["missing", "fixture"]);
+      const backup = streamRequests[1].request;
+      assert.equal(backup.tools, undefined);
+      assert.deepEqual(backup.messages.map(({ role }) => role), ["user", "assistant", "user"]);
+      assert.equal(backup.messages[1].source.privateMetadata, undefined);
+      assert.doesNotMatch(serialized, /secret tool output|secret metadata|secret_tool/);
+    }
   });
 }

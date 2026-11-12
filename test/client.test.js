@@ -5,6 +5,35 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
 
+test('fallback setting defaults off and saves the selected value', async () => {
+  let snapshot = { status: 'ready', writable: true, revision: 1, value: {} };
+  let operations;
+  const scope = {
+    subscribe: () => () => {},
+    getSnapshot: () => snapshot,
+    async mutate(changes, revision) {
+      assert.equal(revision, 1);
+      operations = changes;
+      snapshot = { ...snapshot, value: Object.fromEntries(changes.map((change) => [change.path[0], change.value])) };
+      return true;
+    },
+  };
+  const client = createClient({ configScope: scope });
+  let tree = client.render();
+  let checkbox = tree.children.find((child) => child?.type === 'label' && child.children.includes('预测失败时尝试会话模型')).children[0];
+  assert.equal(checkbox.props.checked, false);
+  checkbox.props.onChange({ target: { checked: true } });
+  tree = client.render();
+  checkbox = tree.children.find((child) => child?.type === 'label' && child.children.includes('预测失败时尝试会话模型')).children[0];
+  assert.equal(checkbox.props.checked, true);
+  const actions = tree.children.find((child) => child?.props?.className === 'dship-actions');
+  await actions.children[0].props.onClick();
+  assert.equal(operations.find((change) => change.path[0] === 'fallbackToSession').value, true);
+  tree = client.render();
+  checkbox = tree.children.find((child) => child?.type === 'label' && child.children.includes('预测失败时尝试会话模型')).children[0];
+  assert.equal(checkbox.props.checked, true);
+});
+
 function deferred() {
   let resolve;
   let reject;
@@ -12,7 +41,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function createClient({ lineTop = null } = {}) {
+function createClient({ lineTop = null, configScope = null } = {}) {
   const hooks = [];
   const listeners = new Map();
   const intervals = new Map();
@@ -92,13 +121,21 @@ function createClient({ lineTop = null } = {}) {
       }
     },
     useLayoutEffect(effect, deps) { React.useEffect(effect, deps); },
-    useSyncExternalStore() {},
+    useSyncExternalStore(_subscribe, getSnapshot) { return getSnapshot(); },
   };
   const window = { addEventListener() {}, removeEventListener() {}, __ModuleLoader__: { load({ factory }) {
     const plugin = factory((name) => { assert.equal(name, 'react'); return React; });
     plugin.apply({
       slots: { inject(_name, register) { register(); }, register(_options, value) { component = value; } },
-      inject() {},
+      inject(_services, callback) {
+        if (!configScope) return;
+        callback({
+          configForms: { get: () => configScope, whileServed: (_names, register) => register() },
+          remote: { session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) }, $on: () => () => {} },
+          effect: (fn) => fn(),
+          slots: { inject(_name, register) { register(); }, register(_options, value) { component = value; } },
+        });
+      },
     });
   } } };
   vm.runInNewContext(source, {
@@ -126,7 +163,8 @@ function createClient({ lineTop = null } = {}) {
       dirty = false;
       cursor = 0;
       pending = [];
-      tree = component(props);
+      tree = component(configScope ? { view: 'page' } : props);
+      if (configScope) tree = tree.type(tree.props);
       const effects = pending;
       pending = [];
       effects.forEach((effect) => effect());

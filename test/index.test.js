@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { apply } from "../lib/index.js";
+import { apply, Config } from "../lib/index.js";
 
 const text = (value) => [{ type: "text", text: value }];
 const userMessage = (value, kind = "user") => ({ role: "user", content: text(value), source: { kind } });
@@ -61,7 +61,7 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
       listModels: async (provider) => (catalog[provider] || []).map((id) => ({ id })),
       async resolveModelInfo(provider, model) {
         if (resolveModel) return resolveModel(provider, model);
-        if (!(catalog[provider] || []).includes(model)) throw new Error("unknown route");
+        if (!(catalog[provider] || []).includes(model)) throw Object.assign(new Error("unknown route"), { code: "UNKNOWN_MODEL" });
         return { provider, id: model };
       },
       async prepareCall(config, signal, configure) {
@@ -374,6 +374,134 @@ test("prefers the session provider when it offers the configured model", async (
   assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["chat", "small"]);
 });
 
+test("fallback configuration defaults off and is volatile", () => {
+  assert.equal(Config.dict.fallbackToSession.type, "boolean");
+  assert.equal(Config.dict.fallbackToSession.meta.default, false);
+  assert.equal(Config.dict.fallbackToSession.meta.volatile, true);
+});
+
+test("fallback shares the prediction deadline and respects cancellation", async () => {
+  for (const cancel of [false, true]) {
+    let release;
+    const host = makeHost({ catalog: { other: ["small"] }, stream: () => (async function* () {
+      await new Promise((resolve) => { release = resolve; });
+      yield { type: "finish", reason: { kind: "error", failure: { code: "SERVER" } } };
+    })() });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true, timeoutMs: 15 });
+    host.end(session);
+    while (!release) await new Promise((resolve) => setTimeout(resolve, 1));
+    if (cancel) host.emit("session/event", session, { type: "turn/start" });
+    else await new Promise((resolve) => setTimeout(resolve, 25));
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(host.calls.length, 1);
+  }
+});
+
+test("fallback inherits the remaining timeout instead of starting a new deadline", async () => {
+  const host = makeHost({ catalog: { other: ["small"] }, stream: (options) => (async function* () {
+    if (options.provider === "other") {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      yield { type: "finish", reason: { kind: "error", failure: { code: "SERVER" } } };
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      yield { type: "text-delta", text: '{"suggestion":"late"}' };
+    }
+  })() });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true, timeoutMs: 50 });
+  const state = await settle(host, session);
+  assert.equal(state.reason, "timeout");
+  assert.equal(host.calls.length, 2);
+  assert.equal(host.calls[0].signal, host.calls[1].signal);
+});
+
+test("fallback is opt-in and route errors require a recognized code", async () => {
+  for (const [code, enabled, expected] of [["UNKNOWN_MODEL", false, 0], ["UNKNOWN_MODEL", true, 1], ["UNKNOWN", true, 0], [undefined, true, 0]]) {
+    const host = makeHost({ resolveModel: () => { throw Object.assign(new Error("secret error"), { code }); } });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: enabled });
+    await settle(host, session);
+    assert.equal(host.calls.length, expected);
+    assert.ok(![...host.warnings, ...host.infos].join(" ").includes("secret error"));
+  }
+});
+
+test("provider fallback uses compact context and shares the per-turn stream budget", async () => {
+  const host = makeHost({ catalog: { other: ["small"] }, stream: (options) => (async function* () {
+    if (options.provider === "other") yield { type: "finish", reason: { kind: "error", failure: { code: "RATE_LIMIT", message: "secret error" } } };
+    else yield { type: "finish", reason: { kind: "stop" } };
+  })() });
+  const session = makeSession({ tools: [{ name: "secret-tool" }] });
+  session.messages.at(-1).source = { kind: "model", provider: "chat", model: "big", replayState: { secret: "private replay" } };
+  host.add(session);
+  apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
+  await settle(host, session);
+  assert.deepEqual(host.calls.map((call) => call.config.provider), ["other", "chat"]);
+  const fallback = host.calls[1].options;
+  assert.equal(fallback.tools, undefined);
+  assert.equal(fallback.toolHistory, undefined);
+  assert.ok(!JSON.stringify(fallback.messages).includes("RULES"));
+  assert.ok(!JSON.stringify(fallback.messages).includes("private replay"));
+  assert.ok(JSON.stringify(host.calls[0].messages).includes("private replay"));
+  await host.triggerFocusIdle(session.id);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(host.calls.length, 2);
+  assert.ok(![...host.warnings, ...host.infos].join(" ").includes("secret error"));
+  assert.ok(host.infos.some((line) => line.includes("event=fallback") && line.includes("code=RATE_LIMIT")
+    && line.includes("fromProvider=other") && line.includes("toProvider=chat")));
+});
+
+test("fallback requires a recognized failure before any text and a distinct route", async () => {
+  for (const [code, textDelta, provider, model, expected] of [
+    ["SERVER", "", "other", "small", 2], ["UNKNOWN", "", "other", "small", 1],
+    ["TIMEOUT", "", "other", "small", 1], ["SERVER", "partial", "other", "small", 1],
+    ["SERVER", "", "chat", "big", 1],
+  ]) {
+    const host = makeHost({ catalog: { other: ["small"], chat: ["big"] }, stream: () => (async function* () {
+      if (textDelta) yield { type: "text-delta", text: textDelta };
+      yield { type: "finish", reason: { kind: "error", failure: { code } } };
+    })() });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, { predictionProvider: provider, predictionModel: model, fallbackToSession: true });
+    await settle(host, session);
+    assert.equal(host.calls.length, expected, `${code}/${textDelta}/${provider}`);
+  }
+});
+
+test("empty, declined, invalid and max-token responses do not trigger fallback", async () => {
+  for (const [reply, finish, reason] of [["", "stop", "empty_output"], ['{"suggestion":null}', "stop", "model_declined"], ["invalid", "stop", "invalid_json"], ["", "max-tokens", "max_tokens"]]) {
+    const host = makeHost({ catalog: { other: ["small"] }, stream: () => (async function* () {
+      if (reply) yield { type: "text-delta", text: reply };
+      yield { type: "finish", reason: { kind: finish } };
+    })() });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
+    assert.equal((await settle(host, session)).reason, reason);
+    assert.equal(host.calls.length, 1);
+  }
+});
+
+test("recognized preparation errors fall back without spending a stream call", async () => {
+  const host = makeHost({ catalog: { other: ["small"] } });
+  const original = host.ctx.llm.prepareCall;
+  host.ctx.llm.prepareCall = async (...args) => {
+    if (args[0].provider === "other") throw Object.assign(new Error("secret"), { code: "NO_ADAPTER" });
+    return original(...args);
+  };
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
+  await settle(host, session);
+  assert.deepEqual(host.calls.map((call) => call.config.provider), ["chat"]);
+});
+
 test("falls back to the session route when the configured model is unavailable or ambiguous", async () => {
   for (const config of [
     { predictionProvider: "responses", predictionModel: "missing" },
@@ -382,7 +510,7 @@ test("falls back to the session route when the configured model is unavailable o
     const host = makeHost({ catalog: { chat: ["big"], a: ["shared"], b: ["shared"], responses: ["small"] } });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, config);
+    apply(host.ctx, { ...config, fallbackToSession: true });
 
     await settle(host, session);
     assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["chat", "big"]);
