@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { test } from "node:test";
-import { apply } from "../index.js";
+import { apply } from "../lib/index.js";
 
 // Use the adapter shipped by DSH; DSH_ROOT can point to a different installation.
 const dshRoot = process.env.DSH_ROOT || "/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh";

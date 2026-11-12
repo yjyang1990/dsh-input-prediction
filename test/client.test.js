@@ -3,12 +3,13 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import vm from 'node:vm';
 
-const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
 
 function deferred() {
   let resolve;
-  const promise = new Promise((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function createClient({ lineTop = null } = {}) {
@@ -17,6 +18,8 @@ function createClient({ lineTop = null } = {}) {
   const intervals = new Map();
   const timeouts = new Map();
   const requests = [];
+  const telemetry = [];
+  const logs = [];
   const styles = [];
   let cursor = 0;
   let pending = [];
@@ -100,8 +103,13 @@ function createClient({ lineTop = null } = {}) {
   } } };
   vm.runInNewContext(source, {
     window, document, AbortController,
+    console: { info: (...args) => logs.push(args) },
     getComputedStyle: () => ({ paddingTop: '12px', paddingBottom: '12px', paddingLeft: '10px', paddingRight: '10px', maxHeight: '336px' }),
     fetch(url, options) {
+      if (url === '/api/dsh-input-prediction/diagnostics') {
+        telemetry.push({ url, options, body: JSON.parse(options.body) });
+        return Promise.resolve({ ok: true });
+      }
       const result = deferred();
       requests.push({ url, options, ...result });
       return result.promise;
@@ -147,10 +155,12 @@ function createClient({ lineTop = null } = {}) {
     }
   }
   function event(type, extra = {}) {
+    if (type === 'focusin') document.activeElement = extra.target || editor;
+    if (type === 'focusout') document.activeElement = extra.relatedTarget || null;
     listeners.get(type)?.({ target: editor, relatedTarget: null, ...extra });
     render();
   }
-  return { render, settle, tickPoll, advance, event, editor, requests, respond, ghost, key, styles, ghostElement, properties, get draft() { return draft; } };
+  return { render, settle, tickPoll, advance, event, editor, requests, telemetry, logs, respond, ghost, key, styles, ghostElement, properties, get draft() { return draft; } };
 }
 
 async function focusedPending() {
@@ -168,6 +178,53 @@ async function pollWith(client, state) {
   client.respond(request, state);
   await client.settle();
 }
+
+test('diagnostics report changes without leaking input, prediction, or session', async () => {
+  const client = createClient();
+  client.render({ sessionId: 'private-session' });
+  client.event('focusin');
+  client.advance(3000);
+  client.respond(client.requests[0], { status: 'pending', prediction: '' });
+  await client.settle();
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '', reason: 'timeout' });
+  assert.ok(client.logs.some(([label, detail]) => label.endsWith('idle') && detail.state === 'waiting-for-backend'));
+  assert.ok(client.logs.some(([label, detail]) => label.endsWith('idle') && detail.state === 'requested'));
+  await pollWith(client, { status: 'ready', completionSeq: 2, prediction: 'private-prediction', reason: 'ok' });
+  assert.ok(client.logs.some(([label, detail]) => label.endsWith('display') && detail.visible));
+  client.editor.innerText = 'private-input';
+  client.event('input');
+  assert.ok(client.logs.some(([label, detail]) => label.endsWith('display') && !detail.empty));
+  assert.doesNotMatch(JSON.stringify(client.logs), /private-session|private-prediction|private-input/);
+  assert.deepEqual(client.telemetry[0].body, { event: 'loaded', detail: {} });
+  assert.ok(client.telemetry.some(({ body }) => body.event === 'idle' && body.detail.state === 'requested'));
+  assert.ok(client.telemetry.some(({ body }) => body.event === 'backend' && body.detail.hasPrediction));
+  assert.ok(client.telemetry.some(({ body }) => body.event === 'display' && body.detail.visible));
+  assert.ok(client.telemetry.every(({ options }) => options.method === 'POST' && options.headers['Content-Type'] === 'application/json'));
+  assert.doesNotMatch(JSON.stringify(client.telemetry), /private-session|private-prediction|private-input/);
+});
+
+test('poll diagnostics deduplicate repeated failures and report recovery', async () => {
+  const client = createClient();
+  client.render();
+  client.requests[0].resolve({ ok: false, status: 503 });
+  await client.settle();
+  client.tickPoll();
+  client.requests.at(-1).resolve({ ok: false, status: 503 });
+  await client.settle();
+  assert.equal(client.logs.filter(([label, detail]) => label.endsWith('poll') && detail.state === 'http-error').length, 1);
+  client.tickPoll();
+  client.requests.at(-1).reject(new Error('private network detail'));
+  await client.settle();
+  await pollWith(client, { status: 'ready', prediction: '', reason: 'timeout' });
+  const pollStates = client.logs.filter(([label]) => label.endsWith('poll')).map(([, detail]) => detail.state);
+  assert.deepEqual(pollStates, ['http-error', 'network-or-response-error', 'ok']);
+  assert.ok(client.logs.some(([label, detail]) => label.endsWith('backend') && detail.reason === 'timeout'));
+  assert.doesNotMatch(JSON.stringify(client.logs), /private network detail/);
+  const pollEvents = client.telemetry.filter(({ body }) => body.event === 'poll');
+  assert.deepEqual(pollEvents.map(({ body }) => body.detail.state), ['http-error', 'network-or-response-error', 'ok']);
+  assert.equal(pollEvents[0].body.detail.status, 503);
+  assert.doesNotMatch(JSON.stringify(client.telemetry), /private network detail/);
+});
 
 test('waits for slow pending prediction and retries an empty result once', async () => {
   const client = await focusedPending();
@@ -206,6 +263,73 @@ test('empty completed state triggers at three seconds and aborts on blur', async
   assert.match(request.url, /trigger=focus-idle/);
   client.event('focusout');
   assert.equal(request.options.signal.aborted, true);
+});
+
+test('empty prediction is retried once per turn across refocus and input', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+  await client.settle();
+  client.event('focusin');
+  client.advance(3000);
+  const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+  assert.equal(retries().length, 1);
+  client.event('focusout');
+  client.event('focusin');
+  client.advance(3000);
+  assert.equal(retries().length, 1);
+  client.event('input');
+  client.advance(3000);
+  assert.equal(retries().length, 1);
+  client.render({ useSession: (selector) => selector({ running: true }) });
+  client.render({ useSession: (selector) => selector({ running: false }) });
+  client.respond(client.requests.at(-1), { status: 'ready', completionSeq: 2, prediction: '' });
+  await client.settle();
+  client.advance(3000);
+  assert.equal(retries().length, 2);
+});
+
+test('a retry from none is tied to its completion and a new turn can retry none', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'none' });
+  await client.settle();
+  client.event('focusin');
+  client.advance(3000);
+  const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+  assert.equal(retries().length, 1);
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '' });
+  client.event('focusout');
+  client.event('focusin');
+  client.advance(3000);
+  assert.equal(retries().length, 1);
+  client.render({ useSession: (selector) => selector({ running: true }) });
+  client.render({ useSession: (selector) => selector({ running: false }) });
+  client.respond(client.requests.at(-1), { status: 'none' });
+  await client.settle();
+  client.advance(3000);
+  assert.equal(retries().length, 2);
+  client.render({ useSession: (selector) => selector({ running: true }) });
+  client.render({ useSession: (selector) => selector({ running: false }) });
+  client.respond(client.requests.at(-1), { status: 'none' });
+  await client.settle();
+  client.advance(3000);
+  assert.equal(retries().length, 3);
+});
+
+test('session switch keeps the actual editor focus for the new session', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: 'first' });
+  await client.settle();
+  client.event('focusin');
+  client.render({ sessionId: 'second' });
+  client.respond(client.requests.at(-1), { status: 'ready', completionSeq: 2, prediction: '' });
+  await client.settle();
+  client.advance(3000);
+  const retries = client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+  assert.equal(retries.length, 1);
+  assert.match(retries[0].url, /sessionId=second/);
 });
 
 test('pending prediction that succeeds does not trigger a retry', async () => {
@@ -251,6 +375,54 @@ test('multiline and wrapped preview uses the complete accepted text', async () =
   assert.equal(client.draft, prediction);
 });
 
+test('streams pending prefixes and accepts only the final prediction', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: 'Hel' });
+  await client.settle();
+  assert.equal(client.ghost().children[0].children[0], 'Hel');
+  assert.equal(client.ghost().children[1], false);
+  client.key('Tab');
+  client.key('ArrowRight');
+  assert.equal(client.draft, undefined);
+  await pollWith(client, { status: 'pending', completionSeq: 1, prediction: 'Hello' });
+  assert.equal(client.ghost().children[0].children[0], 'Hello');
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: 'Hello world' });
+  assert.equal(client.ghost().children[0].children[0], 'Hello world');
+  client.key('ArrowRight');
+  assert.equal(client.draft, 'Hello world');
+});
+
+test('dismissal survives pending updates and completion but not a new turn', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: 'first' });
+  await client.settle();
+  client.key('Escape');
+  client.render();
+  await pollWith(client, { status: 'pending', completionSeq: 1 });
+  await pollWith(client, { status: 'pending', completionSeq: 1, prediction: 'first more' });
+  assert.equal(client.ghost(), undefined);
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: 'first complete' });
+  assert.equal(client.ghost(), undefined);
+  await pollWith(client, { status: 'pending', completionSeq: 2, prediction: 'second' });
+  assert.equal(client.ghost().children[0].children[0], 'second');
+});
+
+test('terminal and failed polls clear a streamed preview', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: 'partial' });
+  await client.settle();
+  await pollWith(client, { status: 'none', reason: 'provider_error' });
+  assert.equal(client.ghost(), undefined);
+  await pollWith(client, { status: 'pending', completionSeq: 2, prediction: 'partial again' });
+  client.tickPoll();
+  client.requests.at(-1).reject(new Error('network error'));
+  await client.settle();
+  assert.equal(client.ghost(), undefined);
+});
+
 test('preview stays within the editor height for a low caret', async () => {
   for (const [lineTop, expectedTop, expectedLimit] of [[350, '250px', '74px'], [420, '12px', '200px']]) {
     const client = createClient({ lineTop });
@@ -291,8 +463,8 @@ test('late responses after session or busy changes cannot replace current state'
   const latest = client.requests[2];
   client.respond(latest, { status: 'ready', completionSeq: 3, prediction: 'new' });
   await client.settle();
-  client.respond(oldSession, { status: 'ready', completionSeq: 1, prediction: 'old session' });
-  client.respond(oldTurn, { status: 'none' });
+  client.respond(oldSession, { status: 'pending', completionSeq: 1, prediction: 'old session' });
+  client.respond(oldTurn, { status: 'pending', completionSeq: 2, prediction: 'old turn' });
   await client.settle();
   assert.equal(client.ghost().children[0].children[0], 'new');
   client.key('Tab');

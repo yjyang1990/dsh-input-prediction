@@ -4,7 +4,7 @@ DeepSeek Harness 插件：参考 Codex 的输入预测，在一轮回复结束�
 
 - 只在回复正常完成后实时生成；若预测为空且聚焦空输入框持续 3 秒，会再尝试一次；打开或切回旧会话的普通轮询不会触发模型调用。
 - 只在回复正常完成后出现；中断或出错的回合不预测；发送中、输入框有内容或输入法组字时隐藏。
-- `Tab`（或 `→`）把预测放入输入框，不会发送，可继续编辑。
+- 预测正文到达时逐步显示；完成后按 `Tab`（或 `→`）把预测放入输入框，不会发送，可继续编辑。生成中不可接受，失败或取消时清除预览。
 - `Esc` 清除本轮预测。
 - 预测模型与会话相同时，沿用会话原有的请求前缀（消息、工具），可命中提示词缓存；换用其他模型时只发送真实用户消息、压缩摘要和助手回复。
 - Provider/模型、推理强度、最大输出 Token 和超时可在插件页配置。
@@ -53,7 +53,7 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 
 ### 排查没有预测内容
 
-在 DSH 日志中搜索 `dsh-input-prediction: result=`。每次请求完成都会记录结果、触发方式（`turn-end` 或 `focus-idle`）和回合序号；自动补发也会单独记录，因此首次请求的原因不会被补发结果覆盖。成功结果使用 info 级别，其他结果使用 warn 级别。日志不包含预测文本、会话内容或 Provider 返回的原始错误。
+在 DSH Host 日志中搜索 `dsh-input-prediction:`。`event=loaded` 表示服务端插件加载，`event=turn_end` 表示收到回合结束事件，`event=skip` 记录不启动预测的原因，`event=start` 记录预测开始；`event=request_prepare`、`event=request_stream` 和 `event=response_parsed` 分别记录模型路由和请求阶段、流开始、解析结果，`result=` 记录完成结果及耗时 `elapsedMs`，`event=cancel` 记录取消原因，`event=disposed` 记录会话销毁时的清理状态，`event=retry_suppressed` 记录重复补发被拦截。`request` 标识本进程中的一次请求，`flow` 关联同一回合的首次预测与补发，`attempt` 是该回合的第几次请求；重启后编号会重置。`trigger` 区分回复结束和空闲触发，`completionSeq` 是回合序号。被取消的请求记录 `event=cancel`，不会产生 `result=`。成功结果使用 info 级别，其他结果使用 warn 级别。日志不包含预测文本、会话内容、会话 ID 或 Provider 返回的原始错误；普通轮询不会逐次记录。
 
 | `result` | 含义 |
 | --- | --- |
@@ -67,7 +67,11 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 | `provider_error` | Provider 调用失败或中止；日志不保留原始错误详情。 |
 | `no_context` / `missing_route` | 会话没有可用上下文，或会话缺少模型路由。 |
 
-同一会话最新完成预测的状态接口也会在 `ready` 时返回 `reason`；它只保存最新状态，历史原因请查看日志。
+`event=route_timing`、`context_timing`、`prepare_timing` 记录路由解析、上下文构造及调用准备耗时。`event=stream_summary` 分别记录模型返回的思考和正文增量次数及字符数、首个非空增量的相对耗时 `firstReasoningMs` / `firstTextMs` 和结束事件耗时 `finishMs`；未出现为 `null`。这些流内耗时从调用流开始计算，包括网络、服务商排队及生成，不能单独区分它们；字符数不等于 Token 数，且取决于 Provider 实际返回的增量类型。
+
+前端会将加载、接口访问、后端状态、展示条件及空闲补发的状态变化回传到 Host 日志，事件名分别为 `event=client_loaded`、`client_poll`、`client_backend`、`client_display` 和 `client_idle`。浏览器 Console 中也可搜索 `[dsh-input-prediction]`。重复状态不会反复记录；回传不包含会话 ID、输入或预测文本。
+
+同一会话最新完成预测的状态接口也会在 `ready` 时返回 `reason`；它只保存最新状态，历史原因请查看日志。Host 日志是否写入磁盘取决于 DSH 配置，默认日志缓冲区保存在运行进程内。
 
 ## 测试
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { apply } from "../index.js";
+import { apply } from "../lib/index.js";
 
 const text = (value) => [{ type: "text", text: value }];
 const userMessage = (value, kind = "user") => ({ role: "user", content: text(value), source: { kind } });
@@ -42,14 +42,16 @@ function makeSession(overrides = {}) {
 function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}', stream, resolveModel } = {}) {
   const calls = [];
   const warnings = [];
+  const infos = [];
   const listeners = {};
   let route;
+  const routes = new Map();
   let lastSession;
   const sessions = new Map();
   const ctx = {
     on(name, listener) { listeners[name] = listener; },
-    logger: { warn: (...args) => warnings.push(args.join(" ")) },
-    connection: { fetch: { register(definition) { route = definition; } } },
+    logger: { warn: (...args) => warnings.push(args.join(" ")), info: (...args) => infos.push(args.join(" ")) },
+    connection: { fetch: { register(definition) { routes.set(definition.path, definition); if (definition.path === "/api/dsh-input-prediction") route = definition; } } },
     sessions: { get: (id) => sessions.get(id) },
     sessionProjections: { stateOf: () => undefined },
     llm: {
@@ -83,6 +85,8 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
     ctx,
     calls,
     warnings,
+    infos,
+    routes,
     add(session) { lastSession = session.id; sessions.set(session.id, session); },
     // A live turn/end or explicit focus-idle request starts a prediction.
     end(session) { listeners["session/event"]?.(session, session.events.at(-1)); },
@@ -109,6 +113,116 @@ async function settle(host, session) {
   }
   throw new Error("prediction stayed pending");
 }
+
+test("streams only decoded suggestion prefixes across chunk boundaries", async () => {
+  let send;
+  let consumed;
+  const host = makeHost({ stream: async function* () {
+    while (true) {
+      const chunk = await new Promise((resolve) => { send = resolve; });
+      if (chunk === null) return;
+      yield { type: "text-delta", text: chunk };
+      consumed();
+    }
+  } });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx);
+  host.end(session);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  async function push(chunk, prediction) {
+    const done = new Promise((resolve) => { consumed = resolve; });
+    send(chunk);
+    await done;
+    const state = await host.poll();
+    assert.equal(state.status, "pending");
+    assert.equal(state.prediction, prediction);
+  }
+  await push('{"sug', "");
+  await push('gestion":"  你', "你");
+  await push('好\\', "你好");
+  await push('"\\uD83D', '你好"');
+  await push('\\uDE00', '你好"😀');
+  await push('\\n世界', '你好"😀\n世界');
+  await push('"}', '你好"😀\n世界');
+  send(null);
+  const state = await settle(host);
+  assert.equal(state.prediction, '你好"😀\n世界');
+  assert.equal(state.status, "ready");
+});
+
+test("does not expose null or unrelated JSON while pending", async () => {
+  for (const text of ['{"suggestion":null', '{"other":"secret', 'not JSON']) {
+    let release;
+    let started;
+    const received = new Promise((resolve) => { started = resolve; });
+    const host = makeHost({ stream: async function* () {
+      yield { type: "text-delta", text };
+      started();
+      await new Promise((resolve) => { release = resolve; });
+    } });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx);
+    host.end(session);
+    await received;
+    assert.equal((await host.poll()).prediction, "", text);
+    release();
+    assert.equal((await settle(host)).prediction, "", text);
+  }
+});
+
+test("clears streamed prefixes on invalid output, failure, timeout and cancellation", async () => {
+  for (const outcome of ["invalid", "error", "throw", "timeout", "cancel"]) {
+    let proceed;
+    let started;
+    const received = new Promise((resolve) => { started = resolve; });
+    const host = makeHost({ stream: async function* () {
+      yield { type: "text-delta", text: '{"suggestion":"草稿' };
+      started();
+      await new Promise((resolve) => { proceed = resolve; });
+      if (outcome === "invalid") yield { type: "text-delta", text: '\\q"}' };
+      if (outcome === "error") yield { type: "finish", reason: { kind: "error" } };
+      if (outcome === "throw") throw new Error("failed");
+    } });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, { timeoutMs: outcome === "timeout" ? 30 : 30000 });
+    host.end(session);
+    await received;
+    assert.equal((await host.poll()).prediction, "草稿");
+    if (outcome === "cancel") {
+      host.emit("session/disposed", session);
+      assert.equal((await host.poll()).status, "none");
+      proceed();
+    } else {
+      if (outcome !== "timeout") proceed();
+      const state = await settle(host);
+      assert.equal(state.status, "ready", outcome);
+      assert.equal(state.prediction, "", outcome);
+      if (outcome === "timeout") proceed();
+    }
+  }
+});
+
+test("logs stage and stream timings without model content", async () => {
+  const host = makeHost({ stream: async function* () {
+    yield { type: "reasoning-delta", text: "private reasoning" };
+    yield { type: "text-delta", text: '{"suggestion":"private suggestion"}' };
+    yield { type: "finish", reason: { kind: "stop" } };
+  } });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx);
+  const result = await settle(host, session);
+  assert.equal(result.prediction, "private suggestion");
+  for (const event of ["route_timing", "context_timing", "prepare_timing"]) {
+    assert.match(host.infos.find((line) => line.includes(`event=${event} `)) ?? "", /elapsedMs=\d+/);
+  }
+  const summary = host.infos.find((line) => line.includes("event=stream_summary ")) ?? "";
+  assert.match(summary, /firstReasoningMs=\d+ firstTextMs=\d+ finishMs=\d+ streamElapsedMs=\d+/);
+  assert.doesNotMatch(host.infos.join("\n"), /private reasoning|private suggestion/);
+});
 
 test("another model gets only real user messages, summaries and assistant replies", async () => {
   const host = makeHost({ catalog: { chat: ["big", "small"] } });
@@ -266,9 +380,32 @@ test("predicts as soon as a completed turn ends", async () => {
   host.emit("session/event", session, session.events.at(-1));
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(host.calls.length, 1);
+  assert.match(host.infos.join("\n"), /event=loaded enabled=true/);
+  assert.match(host.infos.join("\n"), /event=turn_end hasSession=true reason=completed/);
+  assert.match(host.infos.join("\n"), /event=request_prepare request=\d+ provider=chat model=big/);
+  assert.match(host.infos.join("\n"), /event=request_stream request=\d+/);
+  assert.match(host.infos.join("\n"), /event=response_parsed request=\d+ .*reason=ok/);
 });
 
-test("removing a session cancels scheduled turn-end predictions", async () => {
+test("logs why a completed turn is skipped", async () => {
+  for (const [overrides, config, reason] of [
+    [{}, { enabled: false }, "disabled"],
+    [{ header: { parentSession: "parent" } }, {}, "subsession"],
+    [{ route: {} }, {}, "missing_route"],
+    [{ events: [{ type: "turn/start", seq: 1 }, { type: "turn/end", seq: 2, data: { reason: { kind: "completed" } } }] }, {}, "assistant_message_missing"],
+  ]) {
+    const host = makeHost();
+    const session = makeSession(overrides);
+    host.add(session);
+    apply(host.ctx, config);
+    host.end(session);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(host.calls.length, 0);
+    assert.match(host.infos.join("\n"), new RegExp(`event=skip trigger=turn-end .*reason=${reason}|event=skip trigger=turn-end reason=${reason}`));
+  }
+});
+
+test("disposing a session cancels scheduled turn-end predictions", async () => {
   const host = makeHost();
   const session = makeSession();
   host.add(session);
@@ -276,10 +413,32 @@ test("removing a session cancels scheduled turn-end predictions", async () => {
 
   host.end(session);
   host.end(session);
-  host.emit("session/removed", session);
+  host.emit("session/disposed", session);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(host.calls.length, 0);
   assert.deepEqual(await host.poll(), { status: "none" });
+  assert.match(host.infos.join("\n"), /event=disposed scheduled=true state=none/);
+});
+
+test("disposing a session aborts its in-flight prediction", async () => {
+  let started;
+  const streamStarted = new Promise((resolve) => { started = resolve; });
+  const host = makeHost({ stream: ({ signal }) => (async function* () {
+    started();
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+  })() });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+
+  host.end(session);
+  await streamStarted;
+  assert.equal((await host.poll()).status, "pending");
+  host.emit("session/disposed", session);
+  assert.equal(host.calls[0].signal.aborted, true);
+  assert.deepEqual(await host.poll(), { status: "none" });
+  assert.match(host.infos.join("\n"), /event=disposed scheduled=false state=pending request=\d+ flow=\d+/);
+  assert.match(host.infos.join("\n"), /event=cancel request=\d+ flow=\d+ reason=disposed elapsedMs=\d+/);
 });
 
 test("starting another turn cancels a scheduled prediction", async () => {
@@ -330,6 +489,56 @@ test("retries an empty prediction on focus-idle", async () => {
   assert.equal(second.prediction, "继续运行测试");
   assert.equal(second.reason, "ok");
   assert.equal(host.calls.length, 2);
+});
+
+test("limits empty focus-idle predictions to one per completed turn", async () => {
+  const host = makeHost({ reply: '{"suggestion":null}' });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+
+  await settle(host, session);
+  await host.triggerFocusIdle();
+  await settle(host);
+  assert.equal(host.calls.length, 2);
+  await host.triggerFocusIdle();
+  await settle(host);
+  assert.equal(host.calls.length, 2);
+  const starts = host.infos.filter((line) => line.includes("event=start"));
+  assert.equal(starts.length, 2);
+  const firstFlow = starts[0].match(/flow=(\d+)/)?.[1];
+  assert.ok(firstFlow);
+  assert.match(starts[0], new RegExp(`flow=${firstFlow} attempt=1 trigger=turn-end`));
+  assert.match(starts[1], new RegExp(`flow=${firstFlow} attempt=2 trigger=focus-idle`));
+  assert.equal(host.infos.filter((line) => line.includes("event=retry_suppressed")).length, 1);
+  assert.match(host.warnings.join("\n"), /result=model_declined.*elapsedMs=\d+/);
+  const logs = [...host.infos, ...host.warnings].join("\n");
+  assert.doesNotMatch(logs, /帮我把默认错误码改成|已修改，还没有运行测试|suggestion|s\d+\b/);
+
+  session.events = [
+    ...session.events,
+    { type: "turn/start", seq: 4, data: { turn: 2 } },
+    { type: "assistant/message", seq: 5, data: {} },
+    { type: "turn/end", seq: 6, data: { turn: 2, reason: { kind: "completed" } } },
+  ];
+  host.emit("session/event", session, session.events.at(-3));
+  await settle(host, session);
+  await host.triggerFocusIdle();
+  await settle(host);
+  assert.equal(host.calls.length, 4);
+});
+
+test("does not retry an empty focus-idle prediction when there was no initial prediction", async () => {
+  const host = makeHost({ reply: '{"suggestion":null}' });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+
+  await host.triggerFocusIdle();
+  await settle(host);
+  await host.triggerFocusIdle();
+  await settle(host);
+  assert.equal(host.calls.length, 1);
 });
 
 test("times out a provider that never answers", async () => {
@@ -453,6 +662,49 @@ test("classifies provider failures without exposing their contents", async () =>
     assert.equal(state.prediction, "");
     assert.doesNotMatch(JSON.stringify(state) + host.warnings.join(" "), /sensitive provider error/);
   }
+});
+
+test("counts reasoning and text deltas without logging their contents", async () => {
+  const host = makeHost({ stream: () => (async function* () {
+    yield { type: "reasoning-delta", index: 0, text: "秘密" };
+    yield { type: "reasoning-delta", index: 0, text: "思考" };
+    yield { type: "text-delta", index: 1, text: '{"suggestion":"继续"}' };
+    yield { type: "finish", reason: { kind: "stop" } };
+  })() });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+  assert.equal((await settle(host, session)).prediction, "继续");
+  const logs = [...host.infos, ...host.warnings].join("\n");
+  assert.match(logs, /reasoningDeltas=2 reasoningChars=4 textDeltas=1 textChars=19 finishReason=stop/);
+  assert.doesNotMatch(logs, /秘密|思考|继续/);
+});
+
+test("diagnostics validates and logs only allowlisted client state", async () => {
+  const host = makeHost();
+  apply(host.ctx, {});
+  const route = host.routes.get("/api/dsh-input-prediction/diagnostics");
+  assert.deepEqual(route.methods, ["POST"]);
+  assert.equal(route.requestBody, "buffered");
+  const send = (body) => route.fetch(new Request("http://local/api/dsh-input-prediction/diagnostics", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }));
+  for (const body of [
+    { event: "loaded", detail: {} },
+    { event: "poll", detail: { state: "http-error", status: 503 } },
+    { event: "backend", detail: { status: "ready", reason: "ok", hasPrediction: true } },
+    { event: "display", detail: Object.fromEntries(["visible", "hasCurrent", "currentSession", "dismissed", "locked", "busy", "empty", "composing", "focused"].map((key) => [key, false])) },
+    { event: "idle", detail: { state: "requested" } },
+  ]) assert.equal((await send(body)).status, 200);
+  for (const body of [
+    { event: "loaded", detail: { sessionId: "secret" } },
+    { event: "poll", detail: { state: "secret" } },
+    { event: "poll", detail: { state: "ok", status: "200" } },
+    { event: "backend", detail: { status: "ready", reason: "secret", hasPrediction: true } },
+    { event: "display", detail: { visible: true, text: "secret" } },
+    { event: "idle", detail: { state: "requested" }, error: "secret" },
+  ]) assert.equal((await send(body)).status, 400);
+  assert.doesNotMatch(host.infos.join("\n"), /secret/);
 });
 
 test("reports max tokens while preserving a complete parsed suggestion", async () => {
