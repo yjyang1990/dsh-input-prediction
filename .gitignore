@@ -2,3 +2,9 @@ node_modules/
 .serena/
 *.tgz
 .DS_Store
+.agents
+.claude
+.codex
+.cursor
+.vscode
+.dsh
