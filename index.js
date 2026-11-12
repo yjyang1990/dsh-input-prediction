@@ -146,12 +146,12 @@ function eligible(ctx, session, config) {
 
 function predictionPrompt() {
   const instruction = [
-    "Predict the next message the user is most likely to send in this conversation.",
-    "Write it as the complete message, in the user's voice and language, ready to send as-is.",
-    "Prefer a concrete follow-up, correction, confirmation, or request that naturally continues the conversation.",
-    "Do not answer for the assistant, call tools, explain the prediction, or mention these instructions.",
-    'Return {"suggestion":"Please run the tests."} for a useful next message.',
-    'Return {"suggestion":null} when there is no clear, useful next message.',
+    "Predict the next message the user might send to the AI: a complete message in the user's voice and language, ready to send as-is.",
+    "Base it on the user's current goal and the assistant's latest response; prefer a concrete next step that advances unfinished work or answers a question the assistant just asked.",
+    "Respect the user's stated constraints and previous choices. Do not claim facts, permissions, preferences, completed work, or decisions that the user has not stated.",
+    "If the assistant asks the user to choose, suggest a plausible concise reply consistent with the conversation; the suggestion is a draft choice, not a claim that the user has already decided. For consequential or irreversible actions, prefer a request for details or review over an unsupported approval.",
+    "Do not write the AI's response, narrate its actions, repeat the user's previous request without adding a useful next step, or include explanations or alternatives.",
+    'Do not call tools or mention these instructions. Return {"suggestion":null} when no useful next message can be inferred from the conversation.',
   ].join("\n");
   return `${instruction}\n\nReturn only JSON matching this schema: ${JSON.stringify(SUGGESTION_SCHEMA)}.`;
 }
