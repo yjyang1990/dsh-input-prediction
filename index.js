@@ -67,8 +67,7 @@ function textOfContent(content) {
 
 function compactMessages(messages) {
   const list = Array.isArray(messages) ? messages : [];
-  const kept = list.slice(-MAX_CONTEXT_MESSAGES)
-    .filter((message) => message?.role === "assistant"
+  const kept = list.filter((message) => message?.role === "assistant"
       || (message?.role === "user" && USER_CONTEXT_SOURCES.has(message.source?.kind ?? "user")))
     .map((message) => ({
       role: message?.role,
@@ -81,14 +80,21 @@ function compactMessages(messages) {
         ? { source: message.source }
         : {}),
     }))
-    .filter((message) => message.role && message.content.length > 0);
+    .filter((message) => message.role && message.content.length > 0)
+    .slice(-MAX_CONTEXT_MESSAGES);
 
   let total = 0;
   const result = [];
   for (let i = kept.length - 1; i >= 0; i -= 1) {
     const message = kept[i];
-    const size = textOfContent(message.content).length;
-    if (result.length > 0 && total + size > MAX_CONTEXT_CHARS) break;
+    const text = textOfContent(message.content);
+    const size = text.length;
+    if (total + size > MAX_CONTEXT_CHARS) {
+      if (result.length === 0) {
+        result.unshift({ ...message, content: [{ type: "text", text: text.slice(-MAX_CONTEXT_CHARS) }] });
+      }
+      break;
+    }
     result.unshift(message);
     total += size;
   }
@@ -340,16 +346,29 @@ function status(ctx, request, config) {
 }
 
 export function apply(ctx, config = {}) {
+  const pendingTimers = new Map();
   ctx.on?.("session/event", (session, event) => {
     if (!session?.id) return;
-    if (event?.type === "turn/start") clearSession(session.id);
+    if (event?.type === "turn/start") {
+      clearTimeout(pendingTimers.get(session.id));
+      pendingTimers.delete(session.id);
+      clearSession(session.id);
+    }
     // Live: generate as soon as the turn ends, even before the composer asks.
     if (event?.type === "turn/end" && event.data?.reason?.kind === "completed") {
-      setTimeout(() => ensurePrediction(ctx, session, config), 0);
+      clearTimeout(pendingTimers.get(session.id));
+      pendingTimers.set(session.id, setTimeout(() => {
+        pendingTimers.delete(session.id);
+        ensurePrediction(ctx, session, config);
+      }, 0));
     }
   });
   ctx.on?.("session/removed", (session) => {
-    if (session?.id) clearSession(session.id);
+    if (session?.id) {
+      clearTimeout(pendingTimers.get(session.id));
+      pendingTimers.delete(session.id);
+      clearSession(session.id);
+    }
   });
 
   ctx.connection.fetch.register({

@@ -127,6 +127,52 @@ test("another model gets only real user messages, summaries and assistant replie
   ]);
 });
 
+test("different model filters messages before applying the count limit", async () => {
+  const host = makeHost({ catalog: { chat: ["big", "small"] } });
+  const session = makeSession({ messages: [
+    ...Array.from({ length: 85 }, (_, i) => userMessage(`message ${i}`)),
+    ...Array.from({ length: 90 }, () => userMessage("ignored", "agent-instructions")),
+    assistantMessage("latest reply"),
+  ] });
+  host.add(session);
+  apply(host.ctx, { predictionModel: "small" });
+
+  await settle(host, session);
+  const sent = host.calls[0].messages.slice(0, -1);
+  assert.equal(sent.length, 80);
+  assert.equal(sent[0].content[0].text, "message 6");
+  assert.equal(sent.at(-1).content[0].text, "latest reply");
+});
+
+test("different model bounds an oversized latest message including text block separators", async () => {
+  const host = makeHost({ catalog: { chat: ["big", "small"] } });
+  const longText = `${"a".repeat(60000)}\n${"b".repeat(60000)}`;
+  const session = makeSession({ messages: [
+    userMessage("older"),
+    { role: "assistant", content: [ ...text("a".repeat(60000)), ...text("b".repeat(60000)) ] },
+  ] });
+  host.add(session);
+  apply(host.ctx, { predictionModel: "small" });
+
+  await settle(host, session);
+  const sent = host.calls[0].messages.slice(0, -1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].content[0].text.length, 100000);
+  assert.equal(sent[0].content[0].text, longText.slice(-100000));
+});
+
+test("different model retains recent whole messages within the character limit", async () => {
+  const host = makeHost({ catalog: { chat: ["big", "small"] } });
+  const session = makeSession({ messages: [userMessage("x".repeat(50001)), assistantMessage("y".repeat(50000))] });
+  host.add(session);
+  apply(host.ctx, { predictionModel: "small" });
+
+  await settle(host, session);
+  const sent = host.calls[0].messages.slice(0, -1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].content[0].text.length, 50000);
+});
+
 test("uses an explicit provider and model", async () => {
   const host = makeHost({ catalog: { chat: ["big"], responses: ["small"] } });
   const session = makeSession();
@@ -220,6 +266,32 @@ test("predicts as soon as a completed turn ends", async () => {
   host.emit("session/event", session, session.events.at(-1));
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(host.calls.length, 1);
+});
+
+test("removing a session cancels scheduled turn-end predictions", async () => {
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+
+  host.end(session);
+  host.end(session);
+  host.emit("session/removed", session);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(host.calls.length, 0);
+  assert.deepEqual(await host.poll(), { status: "none" });
+});
+
+test("starting another turn cancels a scheduled prediction", async () => {
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+
+  host.end(session);
+  host.emit("session/event", session, { type: "turn/start" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(host.calls.length, 0);
 });
 
 test("starts a focus-idle fallback once and reuses the existing prediction", async () => {

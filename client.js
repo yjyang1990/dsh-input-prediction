@@ -8,8 +8,6 @@ window.__ModuleLoader__.load({
     const POLL_MS = 600;
     const FOCUS_IDLE_MS = 3000;
     const DRAFT_MS = 150;
-    // Longer predictions are clamped; the composer grows to fit what is shown.
-    const MAX_LINES = 6;
     const HEIGHT_VAR = '--dship-ghost-height';
     // Enter is left alone: in an empty composer it usually means "send", and
     // accepting a whole prediction there is a frequent accident.
@@ -33,12 +31,9 @@ window.__ModuleLoader__.load({
         white-space: pre-wrap;
         word-break: break-word;
         overflow-wrap: anywhere;
-        display: -webkit-box;
-        -webkit-box-orient: vertical;
-        -webkit-line-clamp: ${MAX_LINES};
-        line-clamp: ${MAX_LINES};
-        overflow: hidden;
-        pointer-events: none;
+        max-height: min(200px, 25vh);
+        overflow-y: auto;
+        pointer-events: auto;
         user-select: none;
         z-index: 1;
       }
@@ -111,7 +106,12 @@ window.__ModuleLoader__.load({
           const box = editor.getBoundingClientRect();
           const origin = (ghost.offsetParent || card).getBoundingClientRect();
           const line = caretLine(editor)?.getBoundingClientRect();
-          const lineTop = line && line.height > 0 ? line.top : box.top + px(style.paddingTop);
+          const paddingTop = px(style.paddingTop);
+          const paddingBottom = px(style.paddingBottom);
+          const maxHeight = px(style.maxHeight) || Infinity;
+          let lineTop = Math.max(box.top + paddingTop, line && line.height > 0 ? line.top : box.top + paddingTop);
+          if (lineTop - box.top + paddingBottom >= maxHeight - 40) lineTop = box.top + paddingTop;
+          ghost.style.maxHeight = `min(200px, 25vh, ${Math.max(0, Math.min(200, maxHeight - (lineTop - box.top) - paddingBottom))}px)`;
           const left = box.left + px(style.paddingLeft);
           ghost.style.top = `${lineTop - origin.top}px`;
           ghost.style.left = `${left - origin.left}px`;
@@ -253,10 +253,16 @@ window.__ModuleLoader__.load({
 
       // Poll server state: ready after a turn completes, none once a new turn starts.
       useEffect(() => {
-        if (!sessionId) return undefined;
+        if (!sessionId || busy) {
+          setCurrent(null);
+          return undefined;
+        }
         let alive = true;
+        let inFlight = false;
         const controller = new AbortController();
         const poll = async () => {
+          if (inFlight) return;
+          inFlight = true;
           try {
             const response = await fetch(
               `${PREDICTION_PATH}?sessionId=${encodeURIComponent(sessionId)}`,
@@ -277,6 +283,8 @@ window.__ModuleLoader__.load({
               : (text ? { key, text, dismissed: false } : null)));
           } catch {
             // Keep the last state; the next poll retries.
+          } finally {
+            inFlight = false;
           }
         };
         poll();
@@ -286,10 +294,10 @@ window.__ModuleLoader__.load({
           clearInterval(timer);
           controller.abort();
         };
-      }, [sessionId]);
+      }, [sessionId, busy]);
 
       const visible = Boolean(
-        current && !current.dismissed && !locked && !busy && empty && !composing,
+        current && current.key.startsWith(`${sessionId}\u0000`) && !current.dismissed && !locked && !busy && empty && !composing,
       );
 
       useGhostLayout(visible, anchorRef, ghostRef, current?.text);
@@ -342,7 +350,8 @@ window.__ModuleLoader__.load({
         h('span', { ref: anchorRef, className: 'dship-anchor' }),
         visible && h(
           'div',
-          { ref: ghostRef, className: 'dship-prediction', 'aria-hidden': true, 'data-dsh-input-prediction': true },
+          { ref: ghostRef, className: 'dship-prediction', 'aria-hidden': true, 'data-dsh-input-prediction': true,
+            onClick: () => editorOf(anchorRef.current)?.focus({ preventScroll: true }) },
           h('span', null, current.text),
           !hasAcceptedPrediction && h('span', { className: 'dship-prediction__badge' }, '按 Tab 接受'),
         ),
