@@ -39,7 +39,7 @@ function makeSession(overrides = {}) {
   };
 }
 
-function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}', stream } = {}) {
+function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}', stream, resolveModel } = {}) {
   const calls = [];
   const warnings = [];
   const listeners = {};
@@ -55,6 +55,11 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
     llm: {
       listProviders: () => Object.keys(catalog).map((id) => ({ id })),
       listModels: async (provider) => (catalog[provider] || []).map((id) => ({ id })),
+      async resolveModelInfo(provider, model) {
+        if (resolveModel) return resolveModel(provider, model);
+        if (!(catalog[provider] || []).includes(model)) throw new Error("unknown route");
+        return { provider, id: model };
+      },
       async prepareCall(config, signal, configure) {
         const controls = configure ? configure({}, { reasoning: { efforts: [{ id: "off" }, { id: "low" }, { id: "high" }] } }) : {};
         const call = { config: { ...config, ...controls }, messages: undefined, options: undefined, signal: undefined };
@@ -133,6 +138,26 @@ test("uses an explicit provider and model", async () => {
   assert.equal(host.calls[0].config.model, "small");
   // A different model does not inherit the session's reasoning effort.
   assert.equal(host.calls[0].config.reasoningEffort, "off");
+});
+
+test("routes predictions through explicitly selected OpenAI-compatible providers", async () => {
+  for (const provider of ["chat-gateway", "responses-gateway"]) {
+    const host = makeHost({
+      catalog: { chat: ["big"], [provider]: [] },
+      resolveModel: async (id, model) => {
+        assert.deepEqual([id, model], [provider, "custom-model"]);
+        return { provider: id, id: model };
+      },
+    });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, { predictionProvider: provider, predictionModel: "custom-model" });
+
+    const state = await settle(host, session);
+    assert.equal(state.prediction, "继续运行测试");
+    assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], [provider, "custom-model"]);
+    assert.equal(host.calls[0].options.messages.at(-1).role, "user");
+  }
 });
 
 test("finds the only provider offering a model configured without provider", async () => {

@@ -45,11 +45,19 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 
 保存后无需重启，下一次回复结束时生效。配置保存在本机 profile 的 `cordis.patch.yml`。
 
+### OpenAI Responses 和 Chat Completions
+
+插件通过 DSH 的模型 Provider 调用，支持 DSH 已配置的 OpenAI Responses（`openai-responses`）和 OpenAI Chat Completions（`openai-completions`）协议。先在 DSH 的模型设置中添加 Provider，选择对应 API 协议并配置服务地址、凭据和模型；然后在本插件的「预测模型」中选择该 Provider 和模型，或者选择「跟随当前会话模型」。Provider 名称由配置决定，协议名不是固定的 Provider 名称。支持的接口细节和兼容性选项由 DSH 的 Provider 适配器决定。
+
+显式指定 Provider 和模型时，插件通过 DSH 解析该具体路由；模型未列入模型目录本身不代表路由不可用。模型目录仍用于设置页选项，以及旧版仅填写模型名称时匹配 Provider。实际请求失败时会记录日志，预测结果为空。
+
 ## 测试
 
 ```sh
 pnpm test
 ```
+
+协议集成测试使用本机 DSH 安装中的 pi-ai 适配器和本地 HTTP 模拟服务。非默认安装路径可通过 `DSH_ROOT` 指定；未找到默认安装时跳过该集成测试。
 
 ## 更新
 

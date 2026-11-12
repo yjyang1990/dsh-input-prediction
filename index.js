@@ -168,8 +168,8 @@ async function offers(ctx, provider, model) {
   return models.some((item) => item?.id === model);
 }
 
-// Explicit provider+model wins when routable. A model without a provider (older
-// configs) prefers the session provider, then the only other provider offering it.
+// Explicit routes are resolved directly: model catalogs are advisory. A model
+// without a provider (older configs) prefers the session provider, then the only other provider offering it.
 // Anything unresolvable falls back to the session's own route.
 async function resolveRoute(ctx, route, config) {
   const sessionRoute = { provider: route.provider, model: route.model };
@@ -177,9 +177,13 @@ async function resolveRoute(ctx, route, config) {
   if (!model) return sessionRoute;
   const provider = readText(config, "predictionProvider");
   if (provider) {
-    if (await offers(ctx, provider, model)) return { provider, model };
-    ctx.logger?.warn?.(`dsh-input-prediction: ${provider}/${model} is unavailable; using the session model`);
-    return sessionRoute;
+    try {
+      await ctx.llm.resolveModelInfo(provider, model);
+      return { provider, model };
+    } catch {
+      ctx.logger?.warn?.(`dsh-input-prediction: ${provider}/${model} is unavailable; using the session model`);
+      return sessionRoute;
+    }
   }
   if (await offers(ctx, route.provider, model)) return { provider: route.provider, model };
   const others = (ctx.llm.listProviders?.() || [])
