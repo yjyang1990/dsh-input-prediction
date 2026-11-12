@@ -166,6 +166,8 @@ window.__ModuleLoader__.load({
       const [composing, setComposing] = useState(false);
       const idleRequestedRef = useRef(false);
       const idleControllerRef = useRef(null);
+      const idleRetryRef = useRef(null);
+      const serverStateRef = useRef(null);
       // { key, text, dismissed } for the session's latest completed turn.
       const [current, setCurrent] = useState(null);
 
@@ -180,6 +182,7 @@ window.__ModuleLoader__.load({
         const update = () => setEmpty(editorIsEmpty(editorOf(anchorRef.current)));
         const onInput = () => {
           idleRequestedRef.current = false;
+          idleRetryRef.current = null;
           update();
           setInputRevision((value) => value + 1);
         };
@@ -194,6 +197,7 @@ window.__ModuleLoader__.load({
           const editor = editorOf(anchorRef.current);
           if (editor && !editor.contains(event.relatedTarget)) {
             idleRequestedRef.current = false;
+            idleRetryRef.current = null;
             setFocused(false);
           }
         };
@@ -234,8 +238,8 @@ window.__ModuleLoader__.load({
       // to start the fallback only when the normal turn-end prediction is absent.
       useEffect(() => {
         if (!focused || !empty || composing || busy || locked || !sessionId || idleRequestedRef.current) return undefined;
-        const timer = setTimeout(() => {
-          idleRequestedRef.current = true;
+        const request = () => {
+          idleRetryRef.current = null;
           const controller = new AbortController();
           idleControllerRef.current = controller;
           fetch(`${PREDICTION_PATH}?sessionId=${encodeURIComponent(sessionId)}&trigger=focus-idle`, {
@@ -243,9 +247,19 @@ window.__ModuleLoader__.load({
           }).catch(() => {
             // The regular poll retries visibility; a later focus or input starts a new fallback.
           });
+        };
+        const timer = setTimeout(() => {
+          idleRequestedRef.current = true;
+          const state = serverStateRef.current;
+          if (!state || state.sessionId !== sessionId || state.status === 'pending') {
+            idleRetryRef.current = request;
+          } else if (state.status === 'none' || (state.status === 'ready' && !state.prediction)) {
+            request();
+          }
         }, FOCUS_IDLE_MS);
         return () => {
           clearTimeout(timer);
+          idleRetryRef.current = null;
           idleControllerRef.current?.abort();
           idleControllerRef.current = null;
         };
@@ -257,6 +271,7 @@ window.__ModuleLoader__.load({
           setCurrent(null);
           return undefined;
         }
+        serverStateRef.current = null;
         let alive = true;
         let inFlight = false;
         const controller = new AbortController();
@@ -271,6 +286,12 @@ window.__ModuleLoader__.load({
             if (!response.ok || !alive) return;
             const state = await response.json();
             if (!alive) return;
+            const prediction = typeof state?.prediction === 'string' ? state.prediction.trim() : '';
+            serverStateRef.current = { sessionId, status: state?.status, prediction };
+            if (idleRetryRef.current && (state?.status === 'ready' || state?.status === 'none')) {
+              if (state.status === 'none' || !prediction) idleRetryRef.current();
+              else idleRetryRef.current = null;
+            }
             if (state?.status === 'none') {
               setCurrent(null);
               return;

@@ -15,12 +15,14 @@ function createClient({ lineTop = null } = {}) {
   const hooks = [];
   const listeners = new Map();
   const intervals = new Map();
+  const timeouts = new Map();
   const requests = [];
   const styles = [];
   let cursor = 0;
   let pending = [];
   let dirty = false;
   let nextTimer = 0;
+  let now = 0;
   let component;
   let tree;
   let draft;
@@ -106,8 +108,8 @@ function createClient({ lineTop = null } = {}) {
     },
     setInterval(fn, ms) { const id = ++nextTimer; intervals.set(id, { fn, ms }); return id; },
     clearInterval(id) { intervals.delete(id); },
-    setTimeout() { return ++nextTimer; },
-    clearTimeout() {},
+    setTimeout(fn, ms) { const id = ++nextTimer; timeouts.set(id, { fn, due: now + ms }); return id; },
+    clearTimeout(id) { timeouts.delete(id); },
   });
   let props = { sessionId: 'first', locked: false, inputActions: { setDraft(value) { draft = value; } } };
   function render(nextProps = {}) {
@@ -138,8 +140,100 @@ function createClient({ lineTop = null } = {}) {
     const event = { key, target: editor, preventDefault() {}, stopPropagation() {} };
     listeners.get('keydown')?.(event);
   }
-  return { render, settle, tickPoll, requests, respond, ghost, key, styles, ghostElement, properties, get draft() { return draft; } };
+  function advance(ms) {
+    now += ms;
+    for (const [id, timer] of timeouts) {
+      if (timer.due <= now) { timeouts.delete(id); timer.fn(); }
+    }
+  }
+  function event(type, extra = {}) {
+    listeners.get(type)?.({ target: editor, relatedTarget: null, ...extra });
+    render();
+  }
+  return { render, settle, tickPoll, advance, event, editor, requests, respond, ghost, key, styles, ghostElement, properties, get draft() { return draft; } };
 }
+
+async function focusedPending() {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: '' });
+  await client.settle();
+  client.event('focusin');
+  return client;
+}
+
+async function pollWith(client, state) {
+  client.tickPoll();
+  const request = client.requests.at(-1);
+  client.respond(request, state);
+  await client.settle();
+}
+
+test('waits for slow pending prediction and retries an empty result once', async () => {
+  const client = await focusedPending();
+  client.advance(2999);
+  assert.equal(client.requests.length, 1);
+  client.advance(1);
+  assert.equal(client.requests.length, 1);
+  await pollWith(client, { status: 'pending', completionSeq: 1, prediction: '' });
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '' });
+  assert.equal(client.requests.filter((r) => r.url.includes('trigger=focus-idle')).length, 1);
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '' });
+  assert.equal(client.requests.filter((r) => r.url.includes('trigger=focus-idle')).length, 1);
+});
+
+test('waits for a slow first poll before deciding to trigger', async () => {
+  const client = createClient();
+  client.render();
+  client.event('focusin');
+  client.advance(3000);
+  assert.equal(client.requests.length, 1);
+  client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: '' });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '' });
+  assert.equal(client.requests.filter((r) => r.url.includes('trigger=focus-idle')).length, 1);
+});
+
+test('empty completed state triggers at three seconds and aborts on blur', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+  await client.settle();
+  client.event('focusin');
+  client.advance(3000);
+  const request = client.requests.at(-1);
+  assert.match(request.url, /trigger=focus-idle/);
+  client.event('focusout');
+  assert.equal(request.options.signal.aborted, true);
+});
+
+test('pending prediction that succeeds does not trigger a retry', async () => {
+  const client = await focusedPending();
+  client.advance(3000);
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: 'success' });
+  assert.equal(client.requests.filter((r) => r.url.includes('trigger=focus-idle')).length, 0);
+  assert.equal(client.ghost().children[0].children[0], 'success');
+});
+
+test('blur, input, busy, and session switch cancel pending idle retry', async () => {
+  for (const change of ['blur', 'input', 'busy', 'session']) {
+    const client = await focusedPending();
+    client.advance(3000);
+    if (change === 'blur') client.event('focusout');
+    if (change === 'input') { client.editor.innerText = 'draft'; client.event('input'); }
+    if (change === 'busy') client.render({ useSession: (selector) => selector({ running: true }) });
+    if (change === 'session') client.render({ sessionId: 'second' });
+    if (change === 'busy') client.render({ useSession: (selector) => selector({ running: false }) });
+    if (change === 'session' || change === 'busy') {
+      client.respond(client.requests.at(-1), { status: 'ready', completionSeq: 1, prediction: '' });
+      await client.settle();
+    } else {
+      await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '' });
+    }
+    assert.equal(client.requests.filter((r) => r.url.includes('trigger=focus-idle')).length, 0, change);
+  }
+});
 
 test('multiline and wrapped preview uses the complete accepted text', async () => {
   const client = createClient();

@@ -94,7 +94,7 @@ for (const api of ["openai-completions", "openai-responses"]) {
       if (state.status === "ready") break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.deepEqual(state, { status: "ready", completionSeq: 3, prediction: "继续运行测试" }, JSON.stringify(warnings));
+    assert.deepEqual(state, { status: "ready", completionSeq: 3, prediction: "继续运行测试", reason: "ok" }, JSON.stringify(warnings));
     assert.equal(requests.length, 1);
     assert.equal(requests[0].method, "POST");
     assert.equal(requests[0].path, api === "openai-completions" ? "/v1/chat/completions" : "/v1/responses");

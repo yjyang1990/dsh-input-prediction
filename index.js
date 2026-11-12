@@ -150,22 +150,26 @@ function predictionPrompt() {
     "Write it as the complete message, in the user's voice and language, ready to send as-is.",
     "Prefer a concrete follow-up, correction, confirmation, or request that naturally continues the conversation.",
     "Do not answer for the assistant, call tools, explain the prediction, or mention these instructions.",
-    "Use null when there is no clear, useful next message.",
+    'Return {"suggestion":"Please run the tests."} for a useful next message.',
+    'Return {"suggestion":null} when there is no clear, useful next message.',
   ].join("\n");
   return `${instruction}\n\nReturn only JSON matching this schema: ${JSON.stringify(SUGGESTION_SCHEMA)}.`;
 }
 
 function parseSuggestion(text) {
   const raw = typeof text === "string" ? text.trim() : "";
+  if (!raw) return { prediction: "", reason: "empty_output" };
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
-  if (start < 0 || end <= start) return "";
+  if (start < 0 || end <= start) return { prediction: "", reason: "invalid_json" };
   try {
-    const suggestion = JSON.parse(raw.slice(start, end + 1))?.suggestion;
-    if (typeof suggestion !== "string") return "";
-    return suggestion.replace(/\r\n/g, "\n").trim().slice(0, MAX_PREDICTION_CHARS);
+    const value = JSON.parse(raw.slice(start, end + 1));
+    if (value?.suggestion === null) return { prediction: "", reason: "model_declined" };
+    if (typeof value?.suggestion !== "string") return { prediction: "", reason: "invalid_suggestion" };
+    const prediction = value.suggestion.replace(/\r\n/g, "\n").trim().slice(0, MAX_PREDICTION_CHARS);
+    return { prediction, reason: prediction ? "ok" : "invalid_suggestion" };
   } catch {
-    return "";
+    return { prediction: "", reason: "invalid_json" };
   }
 }
 
@@ -187,7 +191,7 @@ async function resolveRoute(ctx, route, config) {
       await ctx.llm.resolveModelInfo(provider, model);
       return { provider, model };
     } catch {
-      ctx.logger?.warn?.(`dsh-input-prediction: ${provider}/${model} is unavailable; using the session model`);
+      ctx.logger?.warn?.("dsh-input-prediction: configured route unavailable; using the session model");
       return sessionRoute;
     }
   }
@@ -230,13 +234,13 @@ function chooseEffort(configured, info) {
 async function generate(ctx, session, config, signal) {
   const header = session.requestHeader?.();
   const route = header?.config;
-  if (!route?.provider || !route?.model) return "";
+  if (!route?.provider || !route?.model) return { prediction: "", reason: "missing_route" };
 
   const { provider, model } = await resolveRoute(ctx, route, config);
   signal.throwIfAborted();
   const sameModel = provider === route.provider && model === route.model;
   const context = requestContext(session, header, sameModel);
-  if (!context) return "";
+  if (!context) return { prediction: "", reason: "no_context" };
   const configuredEffort = readText(config, "reasoningEffort");
   const maxTokens = readPositive(config, "maxTokens", DEFAULT_MAX_TOKENS);
 
@@ -251,6 +255,7 @@ async function generate(ctx, session, config, signal) {
   signal.throwIfAborted();
 
   let text = "";
+  let hitMaxTokens = false;
   for await (const chunk of call.stream({
     ...call.config,
     ...context,
@@ -263,15 +268,17 @@ async function generate(ctx, session, config, signal) {
   })) {
     signal.throwIfAborted();
     if (chunk?.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
-    if (chunk?.type === "finish" && chunk.reason?.kind === "error") {
-      ctx.logger?.warn?.("dsh-input-prediction: provider request failed", chunk.reason.failure);
-      return "";
+    if (chunk?.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
+      ctx.logger?.warn?.("dsh-input-prediction: provider request failed");
+      return { prediction: "", reason: "provider_error" };
     }
     if (chunk?.type === "finish" && chunk.reason?.kind === "max-tokens") {
+      hitMaxTokens = true;
       ctx.logger?.warn?.(`dsh-input-prediction: reply hit maxTokens (${call.config.maxTokens ?? maxTokens}); raise maxTokens or lower reasoningEffort`);
     }
   }
-  return parseSuggestion(text);
+  const result = parseSuggestion(text);
+  return hitMaxTokens ? { ...result, reason: "max_tokens" } : result;
 }
 
 function clearSession(sessionId) {
@@ -305,19 +312,27 @@ function ensurePrediction(ctx, session, config, retryEmpty = false) {
     signal.addEventListener("abort", () => reject(signal.reason), { once: true });
   });
   Promise.race([generate(ctx, session, config, signal), aborted])
-    .then((prediction) => {
-      entry.prediction = prediction;
+    .then((result) => {
+      entry.prediction = result.prediction;
+      entry.reason = result.reason;
     })
-    .catch((error) => {
+    .catch(() => {
       if (entry.controller.signal.aborted) return;
-      if (error?.name === "TimeoutError") {
+      if (signal.aborted && signal.reason?.name === "TimeoutError") {
+        entry.reason = "timeout";
         ctx.logger?.warn?.(`dsh-input-prediction: prediction timed out after ${timeoutMs}ms`);
       } else {
-        ctx.logger?.warn?.("dsh-input-prediction: prediction failed", error);
+        entry.reason = "provider_error";
+        ctx.logger?.warn?.("dsh-input-prediction: prediction failed");
       }
     })
     .finally(() => {
       entry.status = "ready";
+      if (!entry.controller.signal.aborted && entry.reason) {
+        const message = `dsh-input-prediction: result=${entry.reason} trigger=${retryEmpty ? "focus-idle" : "turn-end"} completionSeq=${completionSeq}`;
+        if (entry.reason === "ok") ctx.logger?.info?.(message);
+        else ctx.logger?.warn?.(message);
+      }
     });
   return entry;
 }
@@ -342,6 +357,7 @@ function status(ctx, request, config) {
     status: entry.status,
     completionSeq: entry.completionSeq,
     prediction: entry.status === "ready" ? entry.prediction : "",
+    ...(entry.status === "ready" ? { reason: entry.reason } : {}),
   });
 }
 

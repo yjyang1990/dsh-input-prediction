@@ -323,9 +323,12 @@ test("retries an empty prediction on focus-idle", async () => {
 
   const first = await settle(host, session);
   assert.equal(first.prediction, "");
+  assert.equal(first.reason, "model_declined");
+  assert.match(host.warnings.join("\n"), /result=model_declined trigger=turn-end completionSeq=/);
   await host.triggerFocusIdle();
   const second = await settle(host, session);
   assert.equal(second.prediction, "继续运行测试");
+  assert.equal(second.reason, "ok");
   assert.equal(host.calls.length, 2);
 });
 
@@ -339,7 +342,7 @@ test("times out a provider that never answers", async () => {
   apply(host.ctx, { timeoutMs: 20 });
 
   const state = await settle(host, session);
-  assert.deepEqual([state.status, state.prediction], ["ready", ""]);
+  assert.deepEqual([state.status, state.prediction, state.reason], ["ready", "", "timeout"]);
   assert.equal(host.calls[0].signal.aborted, true);
   assert.match(host.warnings.join("\n"), /timed out after 20ms/);
 });
@@ -357,6 +360,8 @@ test("the session model replays the session's own request prefix for cache hits"
   assert.deepEqual(options.tools, tools);
   assert.deepEqual(options.toolHistory, { tools, updates: [] });
   assert.match(options.messages.at(-1).content[0].text, /Predict the next message/);
+  assert.match(options.messages.at(-1).content[0].text, /\{"suggestion":null\}/);
+  assert.match(options.messages.at(-1).content[0].text, /"additionalProperties":false/);
 });
 
 test("uses a configured effort the model supports", async () => {
@@ -392,5 +397,73 @@ test("warns when the reply runs out of tokens", async () => {
 
   const state = await settle(host, session);
   assert.equal(state.prediction, "");
+  assert.equal(state.reason, "max_tokens");
   assert.match(host.warnings.join("\n"), /hit maxTokens \(8\)/);
+});
+
+test("classifies model output through the registered endpoint", async () => {
+  const cases = [
+    ["", "empty_output", ""],
+    ["  \n", "empty_output", ""],
+    ["plain text", "invalid_json", ""],
+    ['{"suggestion":', "invalid_json", ""],
+    ['{"suggestion":"first"}{"suggestion":"second"}', "invalid_json", ""],
+    ['{"other":"value"}', "invalid_suggestion", ""],
+    ['{"suggestion":42}', "invalid_suggestion", ""],
+    ['{"suggestion":"  "}', "invalid_suggestion", ""],
+    ['{"suggestion":null}', "model_declined", ""],
+    ['```json\n{"suggestion":"继续"}\n```', "ok", "继续"],
+    ['{"suggestion":" first\\r\\nsecond "}', "ok", "first\nsecond"],
+  ];
+  for (const [reply, reason, prediction] of cases) {
+    const host = makeHost({ reply });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, {});
+    const state = await settle(host, session);
+    assert.equal(state.status, "ready", reply);
+    assert.equal(state.reason, reason, reply);
+    assert.equal(state.prediction, prediction, reply);
+  }
+});
+
+test("reports missing conversation context without calling the provider", async () => {
+  const host = makeHost();
+  const session = makeSession({ messages: [] });
+  host.add(session);
+  apply(host.ctx, {});
+  const state = await settle(host, session);
+  assert.deepEqual([state.status, state.prediction, state.reason], ["ready", "", "no_context"]);
+  assert.equal(host.calls.length, 0);
+});
+
+test("classifies provider failures without exposing their contents", async () => {
+  const secret = "sensitive provider error and user content";
+  for (const stream of [
+    () => (async function* () { yield { type: "finish", reason: { kind: "error", failure: { message: secret } } }; })(),
+    () => (async function* () { throw new Error(secret); })(),
+    () => (async function* () { yield { type: "finish", reason: { kind: "aborted", failure: { message: secret } } }; })(),
+  ]) {
+    const host = makeHost({ stream });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, {});
+    const state = await settle(host, session);
+    assert.equal(state.reason, "provider_error");
+    assert.equal(state.prediction, "");
+    assert.doesNotMatch(JSON.stringify(state) + host.warnings.join(" "), /sensitive provider error/);
+  }
+});
+
+test("reports max tokens while preserving a complete parsed suggestion", async () => {
+  const host = makeHost({ stream: () => (async function* () {
+    yield { type: "text-delta", text: '{"suggestion":"继续"}' };
+    yield { type: "finish", reason: { kind: "max-tokens" } };
+  })() });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+  const state = await settle(host, session);
+  assert.equal(state.reason, "max_tokens");
+  assert.equal(state.prediction, "继续");
 });
