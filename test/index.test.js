@@ -55,7 +55,7 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
     logger: { warn: (...args) => warnings.push(args.join(" ")), info: (...args) => infos.push(args.join(" ")) },
     connection: { fetch: { register(definition) { routes.set(definition.path, definition); if (definition.path === "/api/dsh-input-prediction") route = definition; } } },
     sessions: { get: (id) => sessions.get(id) },
-    sessionProjections: { stateOf: () => ({ active: false }) },
+    sessionProjections: { snapshot: () => ({ values: { plan: { active: false } } }) },
     llm: {
       listProviders: () => Object.keys(catalog).map((id) => ({ id })),
       listModels: async (provider) => (catalog[provider] || []).map((id) => ({ id })),
@@ -555,8 +555,6 @@ test("reads committed plan state through available host capabilities", async () 
     { name: "service inactive", active: false, source: "service", pending: true },
     { name: "snapshot active without agent", active: true, source: "snapshot" },
     { name: "snapshot inactive without agent", active: false, source: "snapshot" },
-    { name: "legacy active", active: true, source: "legacy" },
-    { name: "legacy inactive", active: false, source: "legacy" },
   ]) {
     const host = makeHost();
     const session = makeSession();
@@ -567,18 +565,13 @@ test("reads committed plan state through available host capabilities", async () 
       planMode: { get: (value) => { assert.equal(value, agent); reads.push("service"); return { active: scenario.active, pending: scenario.pending }; } },
     })[key];
     host.ctx.sessionProjections = {
-      snapshot: scenario.source === "legacy" ? undefined : (value, keys) => {
+      snapshot: (value, keys) => {
         assert.equal(value, session);
         assert.deepEqual(keys, ["plan"]);
         reads.push("snapshot");
         return { values: { plan: { active: scenario.active, pending: !scenario.active } } };
       },
-      stateOf: (value, key) => {
-        assert.equal(value, session);
-        assert.equal(key, "plan");
-        reads.push("legacy");
-        return { active: scenario.active };
-      },
+      stateOf: () => { reads.push("stateOf"); },
     };
     host.add(session);
     apply(host.ctx, {});
@@ -589,21 +582,23 @@ test("reads committed plan state through available host capabilities", async () 
   }
 });
 
-test("falls back after unavailable or invalid plan reads and skips unknown state", async () => {
+test("skips unknown plan state without calling the deprecated projection API", async () => {
   for (const scenario of [
-    { name: "service failure", service: () => { throw new Error("not ready"); }, snapshot: () => ({ values: { plan: { active: false } } }), legacy: () => { throw new Error("unexpected legacy read"); }, calls: 1 },
-    { name: "missing snapshot key", service: () => ({}), snapshot: () => ({ values: {} }), legacy: () => ({ active: false }), calls: 1 },
-    { name: "snapshot failure", service: () => ({}), snapshot: () => { throw new Error("unavailable"); }, legacy: () => ({ active: true }), calls: 0, reason: "plan_mode" },
-    { name: "unknown state", service: () => ({}), snapshot: () => ({ values: { plan: { active: "false" } } }), legacy: () => undefined, calls: 0, reason: "plan_mode_unknown" },
-    { name: "legacy failure", service: () => ({}), snapshot: () => ({ values: {} }), legacy: () => { throw new Error("unavailable"); }, calls: 0, reason: "plan_mode_unknown" },
+    { name: "service failure", service: () => { throw new Error("not ready"); }, snapshot: () => ({ values: { plan: { active: false } } }), calls: 1 },
+    { name: "missing snapshot key", service: () => ({}), snapshot: () => ({ values: {} }), calls: 0, reason: "plan_mode_unknown" },
+    { name: "snapshot failure", service: () => ({}), snapshot: () => { throw new Error("unavailable"); }, calls: 0, reason: "plan_mode_unknown" },
+    { name: "invalid state", service: () => ({}), snapshot: () => ({ values: { plan: { active: "false" } } }), calls: 0, reason: "plan_mode_unknown" },
+    { name: "snapshot unavailable", service: () => ({}), snapshot: undefined, calls: 0, reason: "plan_mode_unknown" },
   ]) {
     const host = makeHost();
     const session = makeSession();
+    let legacyReads = 0;
     host.ctx.get = (key) => ({ agents: { get: () => ({ session }) }, planMode: { get: scenario.service } })[key];
-    host.ctx.sessionProjections = { snapshot: scenario.snapshot, stateOf: scenario.legacy };
+    host.ctx.sessionProjections = { snapshot: scenario.snapshot, stateOf: () => { legacyReads++; return { active: false }; } };
     host.add(session);
     apply(host.ctx, {});
     await settle(host, session);
+    assert.equal(legacyReads, 0, scenario.name);
     assert.equal(host.calls.length, scenario.calls, scenario.name);
     if (scenario.reason) assert.match(host.infos.join("\n"), new RegExp(`reason=${scenario.reason}\\b`), scenario.name);
   }

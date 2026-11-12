@@ -84,7 +84,7 @@ for (const [api, fallback] of [["openai-completions", false], ["openai-responses
       effect(callback) { t.after(callback()); },
       on() {}, logger: { warn: (...args) => warnings.push(args.map((arg) => arg instanceof Error ? arg.stack : arg)) },
       connection: { fetch: { register(definition) { route = definition; } } },
-      sessions: { get: () => session }, sessionProjections: { stateOf: () => ({ active: false }) },
+      sessions: { get: () => session }, sessionProjections: { snapshot: () => ({ values: { plan: { active: false } } }) },
       llm: {
         resolveModelInfo: (provider, model) => adapter.resolveModel(provider, model),
         async prepareCall(config, signal, configure) {
