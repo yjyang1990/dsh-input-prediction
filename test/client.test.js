@@ -41,7 +41,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function createClient({ lineTop = null, configScope = null } = {}) {
+function createClient({ lineTop = null, configScope = null, visibilityState = 'visible', reenterVisibility = false } = {}) {
   const hooks = [];
   const listeners = new Map();
   const intervals = new Map();
@@ -84,6 +84,7 @@ function createClient({ lineTop = null, configScope = null } = {}) {
   };
   const anchor = { closest: () => card };
   const document = {
+    visibilityState,
     head: { appendChild: (style) => styles.push(style) },
     querySelector: () => null,
     querySelectorAll: () => [],
@@ -149,6 +150,10 @@ function createClient({ lineTop = null, configScope = null } = {}) {
       }
       const result = deferred();
       requests.push({ url, options, ...result });
+      if (reenterVisibility) {
+        reenterVisibility = false;
+        listeners.get('visibilitychange')?.();
+      }
       return result.promise;
     },
     setInterval(fn, ms) { const id = ++nextTimer; intervals.set(id, { fn, ms }); return id; },
@@ -198,7 +203,11 @@ function createClient({ lineTop = null, configScope = null } = {}) {
     listeners.get(type)?.({ target: editor, relatedTarget: null, ...extra });
     render();
   }
-  return { render, settle, tickPoll, advance, event, editor, requests, telemetry, logs, respond, ghost, key, styles, ghostElement, properties, get draft() { return draft; }, get activeElement() { return document.activeElement; } };
+  function setVisibility(value) {
+    document.visibilityState = value;
+    event('visibilitychange');
+  }
+  return { render, settle, tickPoll, advance, event, setVisibility, editor, requests, telemetry, logs, respond, ghost, key, styles, ghostElement, properties, intervals, get draft() { return draft; }, get activeElement() { return document.activeElement; } };
 }
 
 async function focusedPending() {
@@ -483,6 +492,90 @@ test('preview stays within the editor height for a low caret', async () => {
     assert.equal(client.ghostElement.style.maxHeight, `min(200px, 25vh, ${expectedLimit})`);
     assert.ok(Number.parseFloat(client.properties.get('--dship-ghost-height')) <= 336);
   }
+});
+
+test('visibility pauses ordinary polls and ignores old responses after resuming', async () => {
+  const client = createClient();
+  client.render();
+  const old = client.requests[0];
+  client.setVisibility('hidden');
+  assert.equal(old.options.signal.aborted, true);
+  client.tickPoll();
+  assert.equal(client.requests.length, 1);
+  client.setVisibility('visible');
+  client.setVisibility('visible');
+  assert.equal(client.requests.length, 2);
+  client.tickPoll();
+  assert.equal(client.requests.length, 2);
+  client.respond(client.requests[1], { status: 'ready', completionSeq: 2, prediction: 'new' });
+  await client.settle();
+  client.respond(old, { status: 'ready', completionSeq: 1, prediction: 'old' });
+  await client.settle();
+  assert.equal(client.ghost().children[0].children[0], 'new');
+  client.tickPoll();
+  assert.equal(client.requests.length, 3);
+});
+
+test('hidden mount and session or busy changes wait until visible', async () => {
+  const client = createClient({ visibilityState: 'hidden' });
+  client.render();
+  client.render({ sessionId: 'second' });
+  client.render({ useSession: (selector) => selector({ running: true }) });
+  client.setVisibility('visible');
+  assert.equal(client.requests.length, 0);
+  client.render({ useSession: (selector) => selector({ running: false }) });
+  assert.equal(client.requests.length, 1);
+  assert.match(client.requests[0].url, /sessionId=second/);
+  client.setVisibility('hidden');
+  client.render({ sessionId: 'third' });
+  client.setVisibility('visible');
+  assert.equal(client.requests.length, 2);
+  assert.match(client.requests[1].url, /sessionId=third/);
+});
+
+test('hiding does not cancel a focus-idle fallback', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'none' });
+  await client.settle();
+  client.event('focusin');
+  client.advance(3000);
+  const fallback = client.requests[1];
+  assert.match(fallback.url, /trigger=focus-idle/);
+  client.setVisibility('hidden');
+  assert.equal(fallback.options.signal.aborted, false);
+  client.tickPoll();
+  assert.equal(client.requests.length, 2);
+  client.setVisibility('visible');
+  assert.equal(client.requests.length, 3);
+  assert.equal(fallback.options.signal.aborted, false);
+});
+
+test('a waiting idle retry survives hiding and runs after the resumed poll', async () => {
+  const client = createClient();
+  client.render();
+  client.event('focusin');
+  client.advance(3000);
+  client.setVisibility('hidden');
+  client.respond(client.requests[0], { status: 'none' });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+  client.setVisibility('visible');
+  client.respond(client.requests[1], { status: 'none' });
+  await client.settle();
+  assert.equal(client.requests.length, 3);
+  assert.match(client.requests[2].url, /trigger=focus-idle/);
+});
+
+test('synchronous visibility reentry keeps one poll and one draft timer', () => {
+  const client = createClient({ reenterVisibility: true });
+  client.render();
+  assert.equal(client.requests.length, 1);
+  assert.equal([...client.intervals.values()].filter(({ ms }) => ms === 600).length, 1);
+  assert.equal([...client.intervals.values()].filter(({ ms }) => ms === 150).length, 1);
+  client.setVisibility('hidden');
+  assert.equal([...client.intervals.values()].filter(({ ms }) => ms === 600).length, 0);
+  assert.equal([...client.intervals.values()].filter(({ ms }) => ms === 150).length, 1);
 });
 
 test('polls never overlap and recover after the response settles', async () => {
