@@ -98,6 +98,13 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
       const response = await route.fetch(new Request(`http://local/api/dsh-input-prediction?sessionId=${sessionId}`));
       return response.json();
     },
+    async post(body = { sessionId: lastSession }, query = "") {
+      return route.fetch(new Request(`http://local/api/dsh-input-prediction${query}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }));
+    },
     async triggerFocusIdle(sessionId = lastSession) {
       const response = await route.fetch(new Request(`http://local/api/dsh-input-prediction?sessionId=${sessionId}&trigger=focus-idle`));
       return response.json();
@@ -878,6 +885,88 @@ test("uses a configured effort the model supports", async () => {
 
   await settle(host, session);
   assert.equal(host.calls[0].config.reasoningEffort, "low");
+});
+
+test("POST reads none without generating predictions, even with a query trigger", async () => {
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+  const route = host.routes.get("/api/dsh-input-prediction");
+  assert.deepEqual(route.methods, ["GET", "POST"]);
+  assert.equal(route.requestBody, "buffered");
+
+  for (let i = 0; i < 3; i += 1) {
+    const response = await host.post({ sessionId: session.id }, "?trigger=focus-idle");
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await response.json(), { status: "none" });
+  }
+  assert.deepEqual(await (await host.post({ sessionId: "missing" })).json(), { status: "none" });
+  assert.deepEqual(await host.poll(), { status: "none" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(host.calls.length, 0);
+});
+
+test("POST reads the same ready prediction as GET without additional model calls", async () => {
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+  const ready = await settle(host, session);
+  assert.deepEqual(ready, {
+    status: "ready", completionSeq: 3, prediction: "继续运行测试", reason: "ok",
+  });
+
+  for (let i = 0; i < 3; i += 1) {
+    const response = await host.post({ sessionId: session.id }, "?sessionId=missing&trigger=focus-idle");
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), ready);
+  }
+  assert.deepEqual(await host.poll(), ready);
+  assert.equal(host.calls.length, 1);
+});
+
+test("POST never retries empty predictions while GET focus-idle retains its behavior", async () => {
+  const host = makeHost({ reply: '{"suggestion":null}' });
+  const session = makeSession();
+  host.add(session);
+  apply(host.ctx, {});
+  const ready = await settle(host, session);
+  assert.equal(ready.reason, "model_declined");
+
+  for (let i = 0; i < 3; i += 1) {
+    assert.deepEqual(await (await host.post({ sessionId: session.id }, "?trigger=focus-idle")).json(), ready);
+  }
+  assert.equal(host.calls.length, 1);
+  await host.triggerFocusIdle();
+  assert.deepEqual(await settle(host), ready);
+  assert.equal(host.calls.length, 2);
+});
+
+test("POST rejects invalid JSON, session ids and extra fields before session lookup", async () => {
+  const host = makeHost();
+  let lookups = 0;
+  host.ctx.sessions.get = () => { lookups += 1; };
+  apply(host.ctx, {});
+  for (const body of [null, [], "s1", 1, true, {}, { sessionId: null }, { sessionId: 1 },
+    { sessionId: [] }, { sessionId: {} }, { sessionId: "" }, { sessionId: " \t\n" },
+    { sessionId: " s1" }, { sessionId: "s1 " }, { sessionId: "s1", trigger: "focus-idle" },
+    { sessionId: "s1", workspaceId: "workspace" }]) {
+    const response = await host.post(body, "?sessionId=s1&trigger=focus-idle");
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "invalid_request" });
+  }
+  const route = host.routes.get("/api/dsh-input-prediction");
+  for (const body of ["", "{", '{"sessionId":']) {
+    const response = await route.fetch(new Request("http://local/api/dsh-input-prediction?sessionId=s1", {
+      method: "POST", headers: { "content-type": "application/json" }, body,
+    }));
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "invalid_request" });
+  }
+  assert.equal(lookups, 0);
+  assert.equal(host.calls.length, 0);
 });
 
 test("opening an old session never calls the model", async () => {

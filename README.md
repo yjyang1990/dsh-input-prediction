@@ -78,6 +78,14 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 
 同一会话最新完成预测的状态接口也会在 `ready` 时返回 `reason`；它只保存最新状态，历史原因请查看日志。Host 日志是否写入磁盘取决于 DSH 配置，默认日志缓冲区保存在运行进程内。
 
+## 跨端状态读取
+
+`POST /api/dsh-input-prediction` 接收 JSON `{ "sessionId": "会话 ID" }`，沿用 Host 的会话读取边界。body 只允许 `sessionId`，要求非空字符串且无首尾空白；无效 JSON、字段类型或额外字段返回 HTTP 400 `{ "error": "invalid_request" }`。
+
+返回复用 GET：无当前预测时为 `{ "status": "none" }`；有预测时包含 `status`（`pending` / `ready`）、`completionSeq`、`prediction`，`ready` 另含 `reason`。响应均带 `Cache-Control: no-store`。
+
+POST 始终只读，重复读取不会生成或重试预测；query 中的 `trigger` 不生效，body 中的 `trigger` 属于额外字段。原有 GET 及其 `trigger=focus-idle` 行为保留。
+
 ## 测试
 
 ```sh
