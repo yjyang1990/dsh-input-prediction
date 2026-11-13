@@ -34,6 +34,30 @@ test('fallback setting defaults off and saves the selected value', async () => {
   assert.equal(checkbox.props.checked, true);
 });
 
+test('timeout settings enforce the supported timer boundary', async () => {
+  let operations;
+  const scope = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: 'ready', writable: true, revision: 1, value: {} }),
+    async mutate(changes) { operations = changes; return true; },
+  };
+  const client = createClient({ configScope: scope });
+  let tree = client.render();
+  let field = tree.children.find((child) => child?.type === 'label' && child.children.includes('超时（秒）')).children[1];
+  assert.equal(field.props.max, 2147483.647);
+  field.props.onChange({ target: { value: '2147483.648' } });
+  tree = client.render();
+  await tree.children.find((child) => child?.props?.className === 'dship-actions').children[0].props.onClick();
+  tree = client.render();
+  assert.equal(operations, undefined);
+  assert.ok(tree.children.find((child) => child?.props?.className === 'dship-actions').children[2].children[0].includes('2147483.647'));
+  field = tree.children.find((child) => child?.type === 'label' && child.children.includes('超时（秒）')).children[1];
+  field.props.onChange({ target: { value: '2147483.647' } });
+  tree = client.render();
+  await tree.children.find((child) => child?.props?.className === 'dship-actions').children[0].props.onClick();
+  assert.equal(operations.find((change) => change.path[0] === 'timeoutMs').value, 2147483647);
+});
+
 function deferred() {
   let resolve;
   let reject;
@@ -226,6 +250,23 @@ async function pollWith(client, state) {
   await client.settle();
 }
 
+test('announces only complete, focused predictions and clears on dismissal', async () => {
+  const client = await focusedPending();
+  const announcement = () => client.render().children.find((child) => child?.props?.className === 'dship-announcement');
+  assert.equal(announcement().props['aria-live'], 'polite');
+  await pollWith(client, { status: 'pending', completionSeq: 1, prediction: '部分' });
+  assert.equal(announcement().children[0], '');
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '继续测试' });
+  assert.equal(announcement().children[0], '输入预测：继续测试。按 Tab 或向右方向键接受，按 Escape 忽略。');
+  assert.equal(client.ghost().props['aria-hidden'], true);
+  client.event('focusout');
+  assert.equal(announcement().children[0], '');
+  client.event('focusin');
+  assert.ok(announcement().children[0].includes('继续测试'));
+  client.key('Escape');
+  assert.equal(announcement().children[0], '');
+});
+
 test('diagnostics report changes without leaking input, prediction, or session', async () => {
   const client = createClient();
   client.render({ sessionId: 'private-session' });
@@ -336,6 +377,49 @@ test('empty prediction is retried once per turn across refocus and input', async
   assert.equal(retries().length, 2);
 });
 
+test('transport failures allow another idle retry in the same turn', async () => {
+  for (const failure of ['network', 'http']) {
+    const client = createClient();
+    client.render();
+    client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+    await client.settle();
+    client.event('focusin');
+    client.advance(3000);
+    const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+    assert.equal(retries().length, 1);
+    if (failure === 'network') retries()[0].reject(new Error('network failed'));
+    else retries()[0].resolve({ ok: false, status: 503 });
+    await client.settle();
+    client.event('focusout');
+    client.event('focusin');
+    client.advance(3000);
+    assert.equal(retries().length, 2, failure);
+    retries()[1].resolve({ ok: true });
+    await client.settle();
+    client.event('focusout');
+    client.event('focusin');
+    client.advance(3000);
+    assert.equal(retries().length, 2, failure);
+  }
+});
+
+test('failed idle request releases a turn learned while it was in flight', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'none' });
+  await client.settle();
+  client.event('focusin');
+  client.advance(3000);
+  const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: '' });
+  retries()[0].reject(new Error('network failed'));
+  await client.settle();
+  client.event('focusout');
+  client.event('focusin');
+  client.advance(3000);
+  assert.equal(retries().length, 2);
+});
+
 test('a retry from none is tied to its completion and a new turn can retry none', async () => {
   const client = createClient();
   client.render();
@@ -413,7 +497,8 @@ test('multiline and wrapped preview uses the complete accepted text', async () =
   client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction });
   await client.settle();
   assert.equal(client.ghost().children[0].children[0], prediction);
-  assert.doesNotMatch(client.styles[0].textContent, /line-clamp|overflow:\s*hidden/);
+  const predictionStyle = client.styles[0].textContent.match(/\.dship-prediction \{([^}]*)\}/)[1];
+  assert.doesNotMatch(predictionStyle, /line-clamp|overflow:\s*hidden/);
   assert.match(client.styles[0].textContent, /overflow-y:\s*auto/);
   assert.match(client.styles[0].textContent, /pointer-events:\s*auto/);
   assert.equal(client.ghostElement.style.maxHeight, 'min(200px, 25vh, 200px)');

@@ -39,7 +39,7 @@ function makeSession(overrides = {}) {
   };
 }
 
-function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}', stream, resolveModel } = {}) {
+function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}', stream, resolveModel, efforts = [{ id: "low" }, { id: "none" }, { id: "high" }] } = {}) {
   const calls = [];
   const warnings = [];
   const infos = [];
@@ -65,7 +65,7 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
         return { provider, id: model };
       },
       async prepareCall(config, signal, configure) {
-        const controls = configure ? configure({}, { reasoning: { efforts: [{ id: "off" }, { id: "low" }, { id: "high" }] } }) : {};
+        const controls = configure ? configure({}, { reasoning: { efforts } }) : {};
         const call = { config: { ...config, ...controls }, messages: undefined, options: undefined, signal: undefined };
         calls.push(call);
         return {
@@ -116,6 +116,22 @@ async function settle(host, session) {
   }
   throw new Error("prediction stayed pending");
 }
+
+test("timeout config and runtime stay within the timer limit", async () => {
+  const max = 2147483647;
+  assert.equal(Config({ timeoutMs: max }).timeoutMs.get(), max);
+  assert.throws(() => Config({ timeoutMs: max + 1 }), /2147483647/);
+  for (const [configured, expected] of [[max, max], [max + 1, max], [4294967296, max], [Number.MAX_SAFE_INTEGER + 1, 30000]]) {
+    const host = makeHost();
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, { timeoutMs: configured });
+    const state = await settle(host, session);
+    assert.equal(state.reason, "ok");
+    assert.ok(host.infos.some((line) => line.includes("timeoutMs=" + expected)));
+    host.dispose();
+  }
+});
 
 test("streams only decoded suggestion prefixes across chunk boundaries", async () => {
   let send;
@@ -331,7 +347,7 @@ test("uses an explicit provider and model", async () => {
   assert.equal(host.calls[0].config.provider, "responses");
   assert.equal(host.calls[0].config.model, "small");
   // A different model does not inherit the session's reasoning effort.
-  assert.equal(host.calls[0].config.reasoningEffort, "off");
+  assert.equal(host.calls[0].config.reasoningEffort, "none");
 });
 
 test("routes predictions through explicitly selected OpenAI-compatible providers", async () => {
@@ -362,6 +378,27 @@ test("finds the only provider offering a model configured without provider", asy
 
   await settle(host, session);
   assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["responses", "small"]);
+});
+
+test("catalog failures never fall back for a model without a provider", async () => {
+  for (const failingProvider of ["chat", "other"]) {
+    for (const code of ["SERVER", "UNKNOWN_MODEL", undefined]) {
+      const host = makeHost({ catalog: { chat: ["big"], other: ["small"] } });
+      const listModels = host.ctx.llm.listModels;
+      host.ctx.llm.listModels = async (provider) => {
+        if (provider === failingProvider) throw Object.assign(new Error("catalog secret"), { code });
+        return listModels(provider);
+      };
+      const session = makeSession();
+      host.add(session);
+      apply(host.ctx, { predictionModel: "small", fallbackToSession: true });
+      const state = await settle(host, session);
+      assert.equal(state.reason, "provider_error");
+      assert.equal(host.calls.length, 0);
+      assert.ok(!host.infos.some((line) => line.includes("event=fallback")));
+      assert.ok(![...host.warnings, ...host.infos].join(" ").includes("catalog secret"));
+    }
+  }
 });
 
 test("prefers the session provider when it offers the configured model", async () => {
@@ -514,8 +551,8 @@ test("falls back to the session route when the configured model is unavailable o
 
     await settle(host, session);
     assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["chat", "big"]);
-    // No configured effort: the model's lowest, not the session's "high".
-    assert.equal(host.calls[0].config.reasoningEffort, "off");
+    // No configured effort: use none, not the session's "high".
+    assert.equal(host.calls[0].config.reasoningEffort, "none");
   }
 });
 
@@ -817,6 +854,22 @@ test("the session model replays the session's own request prefix for cache hits"
   assert.match(options.messages.at(-1).content[0].text, /"additionalProperties":false/);
 });
 
+test("prefers none when supported and falls back to available efforts", async () => {
+  for (const [efforts, expected] of [
+    [[{ id: "low" }, { id: "none" }], "none"],
+    [[{ id: "low" }, { id: "high" }], "low"],
+    [[], undefined],
+  ]) {
+    const host = makeHost({ efforts });
+    const session = makeSession();
+    host.add(session);
+    apply(host.ctx, {});
+
+    await settle(host, session);
+    assert.equal(host.calls[0].config.reasoningEffort, expected);
+  }
+});
+
 test("uses a configured effort the model supports", async () => {
   const host = makeHost();
   const session = makeSession();
@@ -970,6 +1023,7 @@ test("diagnostics validates and logs only allowlisted client state", async () =>
     { event: "backend", detail: { status: "ready", reason: "ok", hasPrediction: true } },
     { event: "display", detail: Object.fromEntries(["visible", "hasCurrent", "currentSession", "dismissed", "locked", "busy", "empty", "composing", "focused"].map((key) => [key, false])) },
     { event: "idle", detail: { state: "requested" } },
+    { event: "idle", detail: { state: "http-error", status: 503 } },
   ]) assert.equal((await send(body)).status, 200);
   for (const body of [
     { event: "loaded", detail: { sessionId: "secret" } },
