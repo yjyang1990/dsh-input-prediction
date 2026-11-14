@@ -1043,6 +1043,115 @@ test('empty prediction is retried once per turn across refocus and input', async
   assert.equal(retries().length, 2);
 });
 
+test('retries once after transport failure while focus stays unchanged', async () => {
+  for (const failure of ['network', 'http']) {
+    const client = createClient();
+    client.render();
+    client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+    await client.settle();
+    client.event('focusin');
+    const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+    client.advance(2999);
+    assert.equal(retries().length, 0, failure);
+    client.advance(1);
+    assert.equal(retries().length, 1, failure);
+    if (failure === 'network') retries()[0].reject(new Error('network failed'));
+    else retries()[0].resolve({ ok: false, status: 503 });
+    await client.settle();
+    client.advance(2999);
+    assert.equal(retries().length, 1, failure);
+    client.advance(1);
+    assert.equal(retries().length, 2, failure);
+    if (failure === 'network') retries()[1].reject(new Error('network failed again'));
+    else retries()[1].resolve({ ok: false, status: 503 });
+    await client.settle();
+    client.advance(12000);
+    await client.settle();
+    assert.equal(retries().length, 2, failure);
+    assert.equal(client.activeElement, client.editor, failure);
+  }
+});
+
+test('cancels scheduled transport retry on blur or session change', async () => {
+  for (const change of ['blur', 'session']) {
+    const client = createClient();
+    client.render();
+    client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+    await client.settle();
+    client.event('focusin');
+    client.advance(3000);
+    const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+    retries()[0].reject(new Error('network failed'));
+    await client.settle();
+    if (change === 'blur') client.event('focusout');
+    else {
+      client.render({ sessionId: 'second' });
+      client.respond(client.requests.at(-1), { status: 'ready', completionSeq: 2, prediction: 'present' });
+      await client.settle();
+    }
+    client.advance(3000);
+    assert.equal(retries().length, 1, change);
+  }
+});
+
+test('skips scheduled transport retry if a prediction arrives', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+  await client.settle();
+  client.event('focusin');
+  client.advance(3000);
+  const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+  retries()[0].reject(new Error('network failed'));
+  await client.settle();
+  await pollWith(client, { status: 'ready', completionSeq: 1, prediction: 'present' });
+  client.advance(3000);
+  assert.equal(retries().length, 1);
+});
+
+test('pauses a scheduled idle request while hidden and restarts the delay when visible', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+  await client.settle();
+  client.event('focusin');
+  const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+  client.advance(1000);
+  client.setVisibility('hidden');
+  client.advance(10000);
+  assert.equal(retries().length, 0);
+  client.setVisibility('visible');
+  client.advance(2999);
+  assert.equal(retries().length, 0);
+  client.advance(1);
+  assert.equal(retries().length, 1);
+  assert.equal(client.activeElement, client.editor);
+});
+
+test('pauses a transport retry while hidden without resetting the retry limit', async () => {
+  const client = createClient();
+  client.render();
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+  await client.settle();
+  client.event('focusin');
+  client.advance(3000);
+  const retries = () => client.requests.filter((request) => request.url.includes('trigger=focus-idle'));
+  retries()[0].reject(new Error('network failed'));
+  await client.settle();
+  client.setVisibility('hidden');
+  client.advance(10000);
+  assert.equal(retries().length, 1);
+  client.setVisibility('visible');
+  client.advance(2999);
+  assert.equal(retries().length, 1);
+  client.advance(1);
+  assert.equal(retries().length, 2);
+  retries()[1].reject(new Error('network failed again'));
+  await client.settle();
+  client.advance(10000);
+  assert.equal(retries().length, 2);
+});
+
 test('transport failures allow another idle retry in the same turn', async () => {
   for (const failure of ['network', 'http']) {
     const client = createClient();
@@ -1308,7 +1417,7 @@ test('hiding does not cancel a focus-idle fallback', async () => {
   assert.equal(fallback.options.signal.aborted, false);
 });
 
-test('a waiting idle retry survives hiding and runs after the resumed poll', async () => {
+test('a waiting idle retry restarts its delay after the resumed poll', async () => {
   const client = createClient();
   client.render();
   client.event('focusin');
@@ -1320,6 +1429,10 @@ test('a waiting idle retry survives hiding and runs after the resumed poll', asy
   client.setVisibility('visible');
   client.respond(client.requests[1], { status: 'none' });
   await client.settle();
+  assert.equal(client.requests.length, 2);
+  client.advance(2999);
+  assert.equal(client.requests.length, 2);
+  client.advance(1);
   assert.equal(client.requests.length, 3);
   assert.match(client.requests[2].url, /trigger=focus-idle/);
 });
