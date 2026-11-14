@@ -857,7 +857,8 @@ test("the session model replays the session's own request prefix for cache hits"
   assert.deepEqual(options.tools, tools);
   assert.deepEqual(options.toolHistory, { tools, updates: [] });
   assert.match(options.messages.at(-1).content[0].text, /Predict the next message/);
-  assert.match(options.messages.at(-1).content[0].text, /\{"suggestion":null\}/);
+  assert.match(options.messages.at(-1).content[0].text, /Always suggest one non-empty/);
+  assert.match(options.messages.at(-1).content[0].text, /"suggestion":\{"type":"string","minLength":1\}/);
   assert.match(options.messages.at(-1).content[0].text, /"additionalProperties":false/);
 });
 
