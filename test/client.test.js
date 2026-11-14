@@ -519,18 +519,18 @@ test('preview preserves editor mouse behavior and focuses when clicked', async (
   assert.equal(client.activeElement, client.editor);
 });
 
-test('streams pending prefixes and accepts only the final prediction', async () => {
+test('hides pending prefixes and displays only the complete prediction', async () => {
   const client = createClient();
   client.render();
   client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: 'Hel' });
   await client.settle();
-  assert.equal(client.ghost().children[0].children[0], 'Hel');
-  assert.equal(client.ghost().children[1], false);
+  assert.equal(client.ghost(), undefined);
   client.key('Tab');
   client.key('ArrowRight');
   assert.equal(client.draft, undefined);
   await pollWith(client, { status: 'pending', completionSeq: 1, prediction: 'Hello' });
-  assert.equal(client.ghost().children[0].children[0], 'Hello');
+  assert.equal(client.ghost(), undefined);
+  client.key('Escape');
   await pollWith(client, { status: 'ready', completionSeq: 1, prediction: 'Hello world' });
   assert.equal(client.ghost().children[0].children[0], 'Hello world');
   client.key('ArrowRight');
@@ -540,7 +540,7 @@ test('streams pending prefixes and accepts only the final prediction', async () 
 test('dismissal survives pending updates and completion but not a new turn', async () => {
   const client = createClient();
   client.render();
-  client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: 'first' });
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: 'first' });
   await client.settle();
   client.key('Escape');
   client.render();
@@ -550,17 +550,23 @@ test('dismissal survives pending updates and completion but not a new turn', asy
   await pollWith(client, { status: 'ready', completionSeq: 1, prediction: 'first complete' });
   assert.equal(client.ghost(), undefined);
   await pollWith(client, { status: 'pending', completionSeq: 2, prediction: 'second' });
-  assert.equal(client.ghost().children[0].children[0], 'second');
+  assert.equal(client.ghost(), undefined);
+  await pollWith(client, { status: 'ready', completionSeq: 2, prediction: 'second complete' });
+  assert.equal(client.ghost().children[0].children[0], 'second complete');
 });
 
-test('terminal and failed polls clear a streamed preview', async () => {
+test('terminal and failed polls keep incomplete predictions hidden', async () => {
   const client = createClient();
   client.render();
   client.respond(client.requests[0], { status: 'pending', completionSeq: 1, prediction: 'partial' });
   await client.settle();
+  assert.equal(client.ghost(), undefined);
   await pollWith(client, { status: 'none', reason: 'provider_error' });
   assert.equal(client.ghost(), undefined);
   await pollWith(client, { status: 'pending', completionSeq: 2, prediction: 'partial again' });
+  assert.equal(client.ghost(), undefined);
+  await pollWith(client, { status: 'ready', completionSeq: 2, prediction: '', reason: 'invalid_json' });
+  assert.equal(client.ghost(), undefined);
   client.tickPoll();
   client.requests.at(-1).reject(new Error('network error'));
   await client.settle();
