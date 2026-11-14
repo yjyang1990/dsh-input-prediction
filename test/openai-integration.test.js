@@ -113,7 +113,7 @@ for (const [api, fallback] of [["openai-completions", false], ["openai-responses
         },
       },
     };
-    apply(ctx, { timeoutMs: 3000, maxTokens: 160, predictionProvider: fallback ? "missing" : "fixture", predictionModel: "fixture-model", fallbackToSession: fallback });
+    apply(ctx, { enabledSessions: { [session.id]: true }, timeoutMs: 3000, maxTokens: 160, predictionProvider: fallback ? "missing" : "fixture", predictionModel: "fixture-model", fallbackToSession: fallback });
     const url = `http://local/api/dsh-input-prediction?sessionId=${session.id}`;
     await route.fetch(new Request(`${url}&trigger=focus-idle`));
     let state;
@@ -131,7 +131,7 @@ for (const [api, fallback] of [["openai-completions", false], ["openai-responses
     const serialized = JSON.stringify(requests[0].body);
     assert.match(serialized, /帮我修改代码/);
     assert.match(serialized, /已修改/);
-    assert.match(serialized, /Predict the next message/);
+    assert.match(serialized, /Recommend the next concrete request/);
     if (fallback) {
       assert.deepEqual(attempts, ["missing", "fixture"]);
       assert.deepEqual(errors, ["MISSING_CREDENTIAL"]);

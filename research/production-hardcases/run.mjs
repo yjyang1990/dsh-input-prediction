@@ -91,7 +91,7 @@ for (const item of inputs) {
     },
   };
   try {
-    apply(ctx, { timeoutMs: 30000, ...(host.config || {}), fallbackToSession: false });
+    apply(ctx, { timeoutMs: 30000, ...(host.config || {}), fallbackToSession: false, enabledSessions: { [session.id]: true } });
     const url = `http://local/api/dsh-input-prediction?sessionId=${encodeURIComponent(session.id)}`;
     await route.fetch(new Request(`${url}&trigger=focus-idle`));
     const timeout = Number.isSafeInteger(host.config?.timeoutMs) && host.config.timeoutMs > 0 ? host.config.timeoutMs : 30000;

@@ -1,6 +1,6 @@
 {
   "name": "dsh-input-prediction",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Codex-style next-message input predictions for DeepSeek Harness",
   "type": "module",
@@ -37,6 +37,7 @@
       "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-context-menu",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-plugin-manager",
@@ -45,7 +46,7 @@
     },
     "install": {
       "preferred": "tarball",
-      "tarball": "https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.gz/refs/heads/main",
+      "tarball": "https://github.com/yjyang1990/dsh-input-prediction/archive/refs/heads/main.tar.gz",
       "git": "https://github.com/yjyang1990/dsh-input-prediction.git"
     }
   },

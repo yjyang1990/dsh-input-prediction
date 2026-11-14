@@ -5,6 +5,43 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
 
+test('session menu targets the captured session and toggles its saved state', async () => {
+  const contributions = [];
+  let enabled = true;
+  const requests = [];
+  const window = { __ModuleLoader__: { load({ factory }) {
+    const plugin = factory(() => ({}));
+    plugin.apply({
+      slots: { inject() {} },
+      inject(services, callback) {
+        if (services[0] === 'contextMenus') callback({
+          effect: (fn) => fn(), contextMenus: { register(value) { contributions.push(value); return () => {}; } },
+        });
+      },
+    });
+  } } };
+  vm.runInNewContext(source, { window, fetch: async (url, options) => {
+    if (url === '/api/dsh-input-prediction/diagnostics') return { ok: true };
+    requests.push({ url, options });
+    return { ok: true, json: async () => ({ enabled }) };
+  } });
+  assert.deepEqual(contributions.map((contribution) => contribution.target), ['session', 'ds-bot.session']);
+  for (const contribution of contributions) {
+    enabled = true;
+    requests.length = 0;
+    const actions = await contribution.resolve({ sessionId: 'session A' }, new AbortController().signal);
+    assert.equal(actions[0].label, '输入预测：已开启');
+    await actions[0].run();
+    assert.equal(requests[0].url, '/api/dsh-input-prediction/session-setting?sessionId=session%20A');
+    assert.deepEqual(JSON.parse(requests[1].options.body), { sessionId: 'session A', enabled: false });
+    enabled = false;
+    const disabledActions = await contribution.resolve({ sessionId: 'session A' }, new AbortController().signal);
+    assert.equal(disabledActions[0].label, '输入预测：已关闭');
+    await disabledActions[0].run();
+    assert.deepEqual(JSON.parse(requests[3].options.body), { sessionId: 'session A', enabled: true });
+  }
+});
+
 test('fallback setting defaults off and saves the selected value', async () => {
   let snapshot = { status: 'ready', writable: true, revision: 1, value: {} };
   let operations;
@@ -65,12 +102,30 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function createClient({ lineTop = null, configScope = null, visibilityState = 'visible', reenterVisibility = false } = {}) {
+function trackedChannels() {
+  const channels = [];
+  class TestChannel extends BroadcastChannel {
+    constructor(name) { super(name); channels.push(this); }
+    set onmessage(listener) {
+      super.onmessage = (event) => { listener(event); this.onNextMessage?.(); };
+    }
+    nextMessage() { return new Promise((resolve) => { this.onNextMessage = resolve; }); }
+    close() { this.closed = true; super.close(); }
+  }
+  return { channels, TestChannel };
+}
+
+function createClient({ lineTop = null, configScope = null, visibilityState = 'visible', reenterVisibility = false,
+  settingEnabled = true, deferSettings = false, deferSettingPost = false, failSettingPost = false, broadcastChannel, sharedSettings } = {}) {
   const hooks = [];
   const listeners = new Map();
   const intervals = new Map();
   const timeouts = new Map();
   const requests = [];
+  const settingRequests = [];
+  const menus = [];
+  const settings = sharedSettings || new Map();
+  const pluginCleanups = [];
   const telemetry = [];
   const logs = [];
   const styles = [];
@@ -113,8 +168,11 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
     querySelector: () => null,
     querySelectorAll: () => [],
     createElement: () => ({ dataset: {} }),
-    addEventListener(type, handler) { listeners.set(type, handler); },
-    removeEventListener(type, handler) { if (listeners.get(type) === handler) listeners.delete(type); },
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(handler);
+    },
+    removeEventListener(type, handler) { listeners.get(type)?.delete(handler); },
   };
   const React = {
     Fragment: Symbol('Fragment'),
@@ -153,6 +211,11 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
     plugin.apply({
       slots: { inject(_name, register) { register(); }, register(_options, value) { component = value; } },
       inject(_services, callback) {
+        if (_services[0] === 'contextMenus') {
+          callback({ effect(fn) { const cleanup = fn(); if (typeof cleanup === 'function') pluginCleanups.push(cleanup); },
+            contextMenus: { register(value) { menus.push(value); return () => {}; } } });
+          return;
+        }
         if (!configScope) return;
         callback({
           configForms: { get: () => configScope, whileServed: (_names, register) => register() },
@@ -164,7 +227,7 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
     });
   } } };
   vm.runInNewContext(source, {
-    window, document, AbortController,
+    window, document, AbortController, URL, BroadcastChannel: broadcastChannel,
     console: { info: (...args) => logs.push(args) },
     getComputedStyle: () => ({ paddingTop: '12px', paddingBottom: '12px', paddingLeft: '10px', paddingRight: '10px', maxHeight: '336px' }),
     fetch(url, options) {
@@ -172,11 +235,26 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
         telemetry.push({ url, options, body: JSON.parse(options.body) });
         return Promise.resolve({ ok: true });
       }
+      if (url.startsWith('/api/dsh-input-prediction/session-setting')) {
+        if (options?.method === 'POST') {
+          const { sessionId, enabled } = JSON.parse(options.body);
+          if (!failSettingPost) settings.set(sessionId, enabled);
+          const result = deferred();
+          settingRequests.push({ url, options, ...result });
+          return deferSettingPost ? result.promise : Promise.resolve({ ok: !failSettingPost });
+        }
+        const result = deferred();
+        settingRequests.push({ url, options, ...result });
+        if (deferSettings) return result.promise;
+        const sessionId = new URL(url, 'http://localhost').searchParams.get('sessionId');
+        const immediate = (value) => ({ then: (fn) => immediate(fn(value)), catch() { return this; } });
+        return immediate({ ok: true, json: () => ({ enabled: settings.get(sessionId) ?? settingEnabled }) });
+      }
       const result = deferred();
       requests.push({ url, options, ...result });
       if (reenterVisibility) {
         reenterVisibility = false;
-        listeners.get('visibilitychange')?.();
+        for (const handler of listeners.get('visibilitychange') || []) handler();
       }
       return result.promise;
     },
@@ -213,7 +291,7 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
   function ghost() { return tree.children.find((child) => child?.props?.className === 'dship-prediction'); }
   function key(key) {
     const event = { key, target: editor, preventDefault() {}, stopPropagation() {} };
-    listeners.get('keydown')?.(event);
+    for (const handler of listeners.get('keydown') || []) handler(event);
   }
   function advance(ms) {
     now += ms;
@@ -224,15 +302,603 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
   function event(type, extra = {}) {
     if (type === 'focusin') document.activeElement = extra.target || editor;
     if (type === 'focusout') document.activeElement = extra.relatedTarget || null;
-    listeners.get(type)?.({ target: editor, relatedTarget: null, ...extra });
+    for (const handler of listeners.get(type) || []) handler({ target: editor, relatedTarget: null, ...extra });
     render();
   }
   function setVisibility(value) {
     document.visibilityState = value;
     event('visibilitychange');
   }
-  return { render, settle, tickPoll, advance, event, setVisibility, editor, requests, telemetry, logs, respond, ghost, key, styles, ghostElement, properties, intervals, get draft() { return draft; }, get activeElement() { return document.activeElement; } };
+  function openMenu(kind, sessionId) {
+    const provider = menus.find((item) => item.target === kind);
+    const target = { sessionId };
+    const sources = provider.observe(target);
+    let actions = [];
+    let preparation;
+    let controller;
+    let preparations = 0;
+    const refresh = () => {
+      controller?.abort();
+      controller = new AbortController();
+      const signal = controller.signal;
+      actions = [];
+      preparations += 1;
+      preparation = Promise.resolve(provider.resolve(target, signal)).then((value) => {
+        if (!signal.aborted) actions = value;
+      });
+    };
+    const unsubscribe = sources.map((source) => source.subscribe(refresh));
+    const close = () => {
+      controller?.abort();
+      for (const release of unsubscribe.splice(0)) release();
+    };
+    pluginCleanups.push(close);
+    refresh();
+    return { close, get actions() { return actions; }, get ready() { return preparation; },
+      get preparations() { return preparations; }, getSnapshot: sources[0].getSnapshot };
+  }
+  function unmount() {
+    for (const hook of hooks) hook?.cleanup?.();
+    for (const cleanup of pluginCleanups.reverse()) cleanup();
+  }
+  return { render, settle, tickPoll, advance, event, setVisibility, unmount, openMenu, editor, requests, settingRequests, settings, menus, telemetry, logs, respond, ghost, key, styles, ghostElement, properties, intervals, get draft() { return draft; }, get activeElement() { return document.activeElement; } };
 }
+
+
+test('default-off sessions only read settings until either menu enables prediction', async () => {
+  for (const target of ['session', 'ds-bot.session']) {
+    const client = createClient({ settingEnabled: false });
+    client.render();
+    client.event('focusin');
+    client.advance(12000);
+    client.tickPoll();
+    assert.equal(client.settingRequests.length, 1);
+    assert.equal(client.settingRequests[0].url, '/api/dsh-input-prediction/session-setting?sessionId=first');
+    assert.equal(client.requests.length, 0);
+    assert.equal(client.telemetry.length, 0);
+
+    const menu = client.menus.find((item) => item.target === target);
+    const [enable] = await menu.resolve({ sessionId: 'first' }, new AbortController().signal);
+    assert.equal(enable.label, '输入预测：已关闭');
+    await enable.run();
+    client.render();
+    assert.equal(client.requests.length, 1);
+    client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+    await client.settle();
+    client.advance(3000);
+    const idle = client.requests.find((request) => request.url.includes('trigger=focus-idle'));
+    assert.ok(idle);
+    client.tickPoll();
+    client.respond(client.requests.at(-1), { status: 'ready', completionSeq: 1, prediction: '预测文本' });
+    await client.settle();
+    assert.ok(client.ghost());
+    client.tickPoll();
+    const poll = client.requests.at(-1);
+
+    const [disable] = await menu.resolve({ sessionId: 'first' }, new AbortController().signal);
+    assert.equal(disable.label, '输入预测：已开启');
+    await disable.run();
+    assert.equal(idle.options.signal.aborted, true);
+    assert.equal(poll.options.signal.aborted, true);
+    client.render();
+    assert.equal(client.ghost(), undefined);
+    client.respond(poll, { status: 'ready', completionSeq: 2, prediction: '旧建议' });
+    await client.settle();
+    assert.equal(client.ghost(), undefined);
+    const count = client.requests.length;
+    const diagnosticCount = client.telemetry.length;
+    client.event('focusout');
+    client.event('focusin');
+    client.advance(12000);
+    client.tickPoll();
+    assert.equal(client.requests.length, count);
+    assert.equal(client.telemetry.length, diagnosticCount);
+  }
+});
+
+test('session switches wait for their own setting and ignore old replies', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  const first = client.settingRequests[0];
+  client.event('focusin');
+  client.render({ sessionId: 'second' });
+  const second = client.settingRequests[1];
+  assert.equal(first.options.signal.aborted, true);
+  client.respond(first, { enabled: true });
+  await client.settle();
+  client.advance(9000);
+  assert.equal(client.requests.length, 0);
+  client.respond(second, { enabled: false });
+  await client.settle();
+  assert.equal(client.requests.length, 0);
+
+  client.render({ sessionId: 'first' });
+  client.respond(client.settingRequests[2], { enabled: true });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: 'first suggestion' });
+  await client.settle();
+  assert.ok(client.ghost());
+  client.render({ sessionId: 'second' });
+  assert.equal(client.ghost(), undefined);
+  client.advance(9000);
+  client.tickPoll();
+  assert.equal(client.requests.length, 1);
+  client.respond(client.settingRequests[3], { enabled: false });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+});
+
+test('updating another session does not enable the selected session', async () => {
+  const client = createClient({ settingEnabled: false });
+  client.render();
+  const [enableOther] = await client.menus[1].resolve({ sessionId: 'second' }, new AbortController().signal);
+  await enableOther.run();
+  client.render();
+  client.event('focusin');
+  client.advance(9000);
+  assert.equal(client.requests.length, 0);
+  client.render({ sessionId: 'second' });
+  assert.equal(client.requests.length, 1);
+  assert.match(client.requests[0].url, /sessionId=second/);
+  client.render({ sessionId: 'first' });
+  assert.equal(client.requests[0].options.signal.aborted, true);
+  client.advance(9000);
+  client.tickPoll();
+  assert.equal(client.requests.length, 1);
+});
+
+test('a successful menu update wins over an earlier settings read', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  const oldRead = client.settingRequests[0];
+  const resolving = client.menus[0].resolve({ sessionId: 'first' }, new AbortController().signal);
+  client.respond(client.settingRequests[1], { enabled: false });
+  const [enable] = await resolving;
+  await enable.run();
+  client.respond(client.settingRequests[3], { enabled: true });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+  client.respond(oldRead, { enabled: false });
+  await client.settle();
+  assert.equal(client.requests[0].options.signal.aborted, false);
+  assert.equal(client.intervals.size > 0, true);
+});
+
+test('disabling wins over an older read that reports enabled', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  const oldRead = client.settingRequests[0];
+  const resolving = client.menus[1].resolve({ sessionId: 'first' }, new AbortController().signal);
+  client.respond(client.settingRequests[1], { enabled: true });
+  const [disable] = await resolving;
+  await disable.run();
+  client.respond(client.settingRequests[3], { enabled: false });
+  await client.settle();
+  client.respond(oldRead, { enabled: true });
+  await client.settle();
+  client.event('focusin');
+  client.advance(9000);
+  client.tickPoll();
+  assert.equal(client.requests.length, 0);
+});
+
+test('a stale menu read follows newer menu updates and toggles the current state', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  client.respond(client.settingRequests[0], { enabled: false });
+  await client.settle();
+  const oldMenu = client.menus[0].resolve({ sessionId: 'first' }, new AbortController().signal);
+  const newMenu = client.menus[1].resolve({ sessionId: 'first' }, new AbortController().signal);
+  client.respond(client.settingRequests[2], { enabled: false });
+  const [enable] = await newMenu;
+  await enable.run();
+  client.respond(client.settingRequests[4], { enabled: true });
+  await client.settle();
+  const poll = client.requests[0];
+  client.respond(client.settingRequests[1], { enabled: false });
+  await client.settle();
+  client.respond(client.settingRequests[5], { enabled: true });
+  const [disable] = await oldMenu;
+  assert.equal(disable.label, '输入预测：已开启');
+  await disable.run();
+  assert.equal(poll.options.signal.aborted, true);
+  client.render();
+  assert.equal(client.requests.length, 1);
+});
+
+test('a menu action opened before another change toggles the latest server setting', async () => {
+  const client = createClient({ settingEnabled: false });
+  client.render();
+  const [oldAction] = await client.menus[0].resolve({ sessionId: 'first' }, new AbortController().signal);
+  const [enable] = await client.menus[1].resolve({ sessionId: 'first' }, new AbortController().signal);
+  await enable.run();
+  client.render();
+  const poll = client.requests[0];
+  assert.equal(client.settings.get('first'), true);
+  await oldAction.run();
+  assert.equal(client.settings.get('first'), false);
+  assert.equal(poll.options.signal.aborted, true);
+  client.render();
+  client.advance(9000);
+  client.tickPoll();
+  assert.equal(client.requests.length, 1);
+});
+
+test('open native and bot menus refresh only for their session and detach on close or unload', async () => {
+  const client = createClient({ settingEnabled: false });
+  client.render();
+  const native = client.openMenu('session', 'first');
+  const bot = client.openMenu('ds-bot.session', 'first');
+  const other = client.openMenu('session', 'other');
+  await Promise.all([native.ready, bot.ready, other.ready]);
+  assert.equal(native.actions[0].label, '输入预测：已关闭');
+  assert.equal(bot.actions[0].label, '输入预测：已关闭');
+  const previous = native.getSnapshot();
+  const otherSnapshot = other.getSnapshot();
+
+  await native.actions[0].run();
+  await Promise.all([native.ready, bot.ready]);
+  assert.equal(native.actions[0].label, '输入预测：已开启');
+  assert.equal(bot.actions[0].label, '输入预测：已开启');
+  assert.notEqual(native.getSnapshot(), previous);
+  assert.equal(other.getSnapshot(), otherSnapshot);
+  assert.equal(other.preparations, 1);
+
+  await other.actions[0].run();
+  await other.ready;
+  assert.equal(other.actions[0].label, '输入预测：已开启');
+  assert.equal(native.preparations, 2);
+  assert.equal(bot.preparations, 2);
+
+  native.close();
+  await bot.actions[0].run();
+  await bot.ready;
+  assert.equal(bot.actions[0].label, '输入预测：已关闭');
+  assert.equal(native.preparations, 2);
+  assert.equal(other.preparations, 2);
+
+  const actionAfterUnload = bot.actions[0];
+  client.unmount();
+  await actionAfterUnload.run();
+  assert.equal(bot.preparations, 3);
+  assert.equal(other.preparations, 2);
+});
+
+test('a refreshed menu hides the stale action while its setting read is pending', async () => {
+  const client = createClient({ deferSettings: true });
+  const native = client.openMenu('session', 'first');
+  const bot = client.openMenu('ds-bot.session', 'first');
+  client.respond(client.settingRequests[0], { enabled: false });
+  client.respond(client.settingRequests[1], { enabled: false });
+  await Promise.all([native.ready, bot.ready]);
+  await bot.actions[0].run();
+  assert.equal(native.actions.length, 0);
+  assert.equal(bot.actions.length, 0);
+  client.respond(client.settingRequests[3], { enabled: true });
+  client.respond(client.settingRequests[4], { enabled: true });
+  await Promise.all([native.ready, bot.ready]);
+  assert.equal(native.actions[0].label, '输入预测：已开启');
+  assert.equal(bot.actions[0].label, '输入预测：已开启');
+  client.unmount();
+});
+
+test('an open menu in another window refreshes after broadcast', { timeout: 3000 }, async () => {
+  const { channels, TestChannel } = trackedChannels();
+  const sharedSettings = new Map();
+  const first = createClient({ settingEnabled: false, sharedSettings, broadcastChannel: TestChannel });
+  const second = createClient({ settingEnabled: false, sharedSettings, broadcastChannel: TestChannel });
+  try {
+    first.render();
+    second.render();
+    const native = first.openMenu('session', 'first');
+    const bot = second.openMenu('ds-bot.session', 'first');
+    const other = second.openMenu('session', 'other');
+    await Promise.all([native.ready, bot.ready, other.ready]);
+    assert.equal(bot.actions[0].label, '输入预测：已关闭');
+
+    const secondNotified = channels[1].nextMessage();
+    await native.actions[0].run();
+    await secondNotified;
+    await Promise.all([native.ready, bot.ready]);
+    assert.equal(native.actions[0].label, '输入预测：已开启');
+    assert.equal(bot.actions[0].label, '输入预测：已开启');
+    assert.equal(other.preparations, 1);
+
+    const firstNotified = channels[0].nextMessage();
+    await bot.actions[0].run();
+    await firstNotified;
+    await Promise.all([native.ready, bot.ready]);
+    assert.equal(native.actions[0].label, '输入预测：已关闭');
+    assert.equal(bot.actions[0].label, '输入预测：已关闭');
+    assert.equal(other.preparations, 1);
+  } finally {
+    first.unmount();
+    second.unmount();
+  }
+});
+
+test('settings failures keep prediction disabled and failed saves do not notify it', async () => {
+  const failedRead = createClient({ deferSettings: true });
+  failedRead.render();
+  failedRead.settingRequests[0].reject(new Error('settings unavailable'));
+  await failedRead.settle();
+  failedRead.event('focusin');
+  failedRead.advance(9000);
+  failedRead.tickPoll();
+  assert.equal(failedRead.requests.length, 0);
+
+  const failedRefresh = createClient({ deferSettings: true });
+  failedRefresh.render();
+  failedRefresh.respond(failedRefresh.settingRequests[0], { enabled: true });
+  await failedRefresh.settle();
+  failedRefresh.setVisibility('hidden');
+  failedRefresh.setVisibility('visible');
+  failedRefresh.settingRequests[1].reject(new Error('settings unavailable'));
+  await failedRefresh.settle();
+  failedRefresh.event('focusin');
+  failedRefresh.advance(9000);
+  failedRefresh.tickPoll();
+  assert.equal(failedRefresh.requests.length, 1);
+  assert.equal(failedRefresh.requests[0].options.signal.aborted, true);
+
+  const failedSave = createClient({ settingEnabled: false, failSettingPost: true });
+  failedSave.render();
+  const failedMenu = failedSave.openMenu('session', 'first');
+  await failedMenu.ready;
+  await assert.rejects(failedMenu.actions[0].run(), /保存输入预测设置失败/);
+  assert.equal(failedMenu.preparations, 1);
+  failedSave.render();
+  failedSave.event('focusin');
+  failedSave.advance(9000);
+  failedSave.tickPoll();
+  assert.equal(failedSave.requests.length, 0);
+  failedSave.unmount();
+});
+
+test('visible windows synchronize successful menu changes and discard stale reads', { timeout: 3000 }, async () => {
+  const { channels, TestChannel } = trackedChannels();
+  const sharedSettings = new Map();
+  const first = createClient({ settingEnabled: false, sharedSettings, broadcastChannel: TestChannel });
+  const second = createClient({ deferSettings: true, sharedSettings, broadcastChannel: TestChannel });
+  const other = createClient({ settingEnabled: false, sharedSettings, broadcastChannel: TestChannel });
+  let secondUnmounted = false;
+  try {
+    first.render();
+    second.render();
+    other.render({ sessionId: 'other' });
+    const staleRead = second.settingRequests[0];
+    const secondEnabled = channels[1].nextMessage();
+    const otherEnabled = channels[2].nextMessage();
+    const [enable] = await first.menus[0].resolve({ sessionId: 'first' }, new AbortController().signal);
+    await enable.run();
+    await Promise.all([secondEnabled, otherEnabled]);
+    second.respond(second.settingRequests[1], { enabled: true });
+    await second.settle();
+    other.render();
+    assert.equal(staleRead.options.signal.aborted, true);
+    assert.equal(second.requests.length, 1);
+    assert.equal(other.requests.length, 0);
+    second.respond(staleRead, { enabled: false });
+    await second.settle();
+    assert.equal(second.requests[0].options.signal.aborted, false);
+    second.respond(second.requests[0], { status: 'ready', completionSeq: 1, prediction: '' });
+    await second.settle();
+    second.event('focusin');
+    second.advance(3000);
+    const idle = second.requests.at(-1);
+    assert.match(idle.url, /trigger=focus-idle/);
+    second.tickPoll();
+    second.respond(second.requests.at(-1), { status: 'ready', completionSeq: 1, prediction: 'window suggestion' });
+    await second.settle();
+    assert.ok(second.ghost());
+    second.tickPoll();
+    const pending = second.requests.at(-1);
+    const secondDisabled = channels[1].nextMessage();
+    const otherDisabled = channels[2].nextMessage();
+    const [disable] = await first.menus[1].resolve({ sessionId: 'first' }, new AbortController().signal);
+    await disable.run();
+    await Promise.all([secondDisabled, otherDisabled]);
+    assert.equal(pending.options.signal.aborted, true);
+    assert.equal(idle.options.signal.aborted, true);
+    second.respond(second.settingRequests[2], { enabled: false });
+    await second.settle();
+    assert.equal(second.ghost(), undefined);
+    second.event('focusin');
+    second.advance(12000);
+    second.tickPoll();
+    assert.equal(second.requests.length, 4);
+    assert.equal(other.requests.length, 0);
+
+    second.unmount();
+    secondUnmounted = true;
+    assert.equal(channels[1].closed, true);
+    const otherReceived = channels[2].nextMessage();
+    const [reenable] = await first.menus[0].resolve({ sessionId: 'first' }, new AbortController().signal);
+    await reenable.run();
+    await otherReceived;
+    assert.equal(second.requests.length, 4);
+  } finally {
+    first.unmount();
+    if (!secondUnmounted) second.unmount();
+    other.unmount();
+  }
+  assert.ok(channels.every((channel) => channel.closed));
+});
+
+test('a delayed older POST and its broadcast do not restore a later disabled setting', { timeout: 3000 }, async () => {
+  const { channels, TestChannel } = trackedChannels();
+  const sharedSettings = new Map();
+  const first = createClient({ settingEnabled: false, deferSettingPost: true, sharedSettings, broadcastChannel: TestChannel });
+  const second = createClient({ settingEnabled: false, sharedSettings, broadcastChannel: TestChannel });
+  try {
+    first.render();
+    second.render();
+    const [enable] = await first.menus[0].resolve({ sessionId: 'first' }, new AbortController().signal);
+    const pendingEnable = enable.run();
+    const oldPost = first.settingRequests.at(-1);
+    assert.equal(JSON.parse(oldPost.options.body).enabled, true);
+    assert.equal(sharedSettings.get('first'), true);
+
+    second.setVisibility('hidden');
+    second.setVisibility('visible');
+    assert.equal(second.requests.length, 1);
+    second.respond(second.requests[0], { status: 'ready', completionSeq: 1, prediction: 'old suggestion' });
+    await second.settle();
+    assert.ok(second.ghost());
+    second.tickPoll();
+    const pendingPoll = second.requests.at(-1);
+
+    const firstNotified = channels[0].nextMessage();
+    const [disable] = await second.menus[1].resolve({ sessionId: 'first' }, new AbortController().signal);
+    await disable.run();
+    assert.equal(pendingPoll.options.signal.aborted, true);
+    second.render();
+    assert.equal(second.ghost(), undefined);
+    assert.equal(sharedSettings.get('first'), false);
+    await firstNotified;
+    first.render();
+    assert.equal(first.requests.length, 0);
+
+    const secondNotified = channels[1].nextMessage();
+    oldPost.resolve({ ok: true });
+    await pendingEnable;
+    await secondNotified;
+    first.render();
+    second.render();
+    first.event('focusin');
+    second.event('focusin');
+    first.advance(12000);
+    second.advance(12000);
+    first.tickPoll();
+    second.tickPoll();
+    assert.equal(first.requests.length, 0);
+    assert.equal(second.requests.length, 2);
+    assert.equal(second.ghost(), undefined);
+    assert.equal(sharedSettings.get('first'), false);
+  } finally {
+    first.unmount();
+    second.unmount();
+  }
+});
+
+test('a failed setting read retries while visible and resumes only after a successful read', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  client.event('focusin');
+  client.settingRequests[0].reject(new Error('temporarily unavailable'));
+  await client.settle();
+  client.advance(4999);
+  assert.equal(client.settingRequests.length, 1);
+  assert.equal(client.requests.length, 0);
+  client.advance(1);
+  assert.equal(client.settingRequests.length, 2);
+  client.respond(client.settingRequests[1], { enabled: true });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+  client.unmount();
+});
+
+test('a successful menu update cancels a scheduled setting retry', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  client.settingRequests[0].reject(new Error('temporarily unavailable'));
+  await client.settle();
+  const resolving = client.menus[0].resolve({ sessionId: 'first' }, new AbortController().signal);
+  client.respond(client.settingRequests[1], { enabled: false });
+  const [enable] = await resolving;
+  await enable.run();
+  client.respond(client.settingRequests[3], { enabled: true });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+  client.advance(5000);
+  assert.equal(client.settingRequests.length, 4);
+  client.unmount();
+});
+
+test('setting retries stop when hidden, changing session, or unmounting', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  client.settingRequests[0].reject(new Error('temporarily unavailable'));
+  await client.settle();
+  client.setVisibility('hidden');
+  client.advance(5000);
+  assert.equal(client.settingRequests.length, 1);
+  client.setVisibility('visible');
+  assert.equal(client.settingRequests.length, 2);
+  client.settingRequests[1].reject(new Error('still unavailable'));
+  await client.settle();
+  client.render({ sessionId: 'second' });
+  assert.equal(client.settingRequests.length, 3);
+  client.advance(5000);
+  assert.equal(client.settingRequests.length, 3);
+  client.settingRequests[2].reject(new Error('still unavailable'));
+  await client.settle();
+  client.unmount();
+  client.advance(5000);
+  assert.equal(client.settingRequests.length, 3);
+  assert.equal(client.requests.length, 0);
+});
+
+test('visibility restore refreshes settings changed by another window', async () => {
+  const client = createClient({ settingEnabled: false });
+  client.render();
+  client.event('focusin');
+  client.settings.set('first', true);
+  client.setVisibility('hidden');
+  client.setVisibility('visible');
+  assert.equal(client.requests.length, 1);
+  client.respond(client.requests[0], { status: 'ready', completionSeq: 1, prediction: 'visible' });
+  await client.settle();
+  assert.ok(client.ghost());
+  client.settings.set('first', false);
+  client.setVisibility('hidden');
+  client.setVisibility('visible');
+  assert.equal(client.ghost(), undefined);
+  const count = client.requests.length;
+  client.advance(9000);
+  client.tickPoll();
+  assert.equal(client.requests.length, count);
+  assert.equal(client.settingRequests.filter((request) => !request.options?.method).length, 3);
+});
+
+test('visibility waits for the latest setting before restarting requests', async () => {
+  const client = createClient({ deferSettings: true });
+  client.render();
+  client.respond(client.settingRequests[0], { enabled: true });
+  await client.settle();
+  client.event('focusin');
+  assert.equal(client.requests.length, 1);
+  client.setVisibility('hidden');
+  client.setVisibility('visible');
+  assert.equal(client.requests[0].options.signal.aborted, true);
+  client.advance(9000);
+  client.tickPoll();
+  assert.equal(client.requests.length, 1);
+  client.respond(client.settingRequests[1], { enabled: false });
+  await client.settle();
+  assert.equal(client.requests.length, 1);
+
+  client.setVisibility('hidden');
+  client.setVisibility('visible');
+  client.respond(client.settingRequests[2], { enabled: true });
+  await client.settle();
+  assert.equal(client.requests.length, 2);
+  client.setVisibility('hidden');
+  client.setVisibility('visible');
+  const earlier = client.settingRequests[3];
+  client.setVisibility('hidden');
+  client.setVisibility('visible');
+  const later = client.settingRequests[4];
+  assert.equal(earlier.options.signal.aborted, true);
+  client.respond(later, { enabled: false });
+  await client.settle();
+  client.respond(earlier, { enabled: true });
+  await client.settle();
+  client.advance(9000);
+  client.tickPoll();
+  assert.equal(client.requests.length, 2);
+});
 
 async function focusedPending() {
   const client = createClient();

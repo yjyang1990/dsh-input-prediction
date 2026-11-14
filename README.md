@@ -2,6 +2,7 @@
 
 DeepSeek Harness 插件：参考 Codex 的输入预测，在一轮回复结束后，于空输入框中预测你的下一条完整消息；若聚焦空输入框 3 秒仍没有预测内容，在本轮调用预算允许时会补发一次预测请求；初次请求仍在进行时，等它结束且结果为空后再补发。
 
+- 每个会话的输入预测默认关闭；在该会话菜单中选择“输入预测：已关闭”可开启，再次选择可关闭。设置按会话保存，重启后保留。
 - 只在回复正常完成后实时生成；若预测为空且聚焦空输入框持续 3 秒，在本轮调用预算允许时会再尝试一次；打开或切回旧会话的普通轮询不会触发模型调用。
 - 只在回复正常完成后出现；中断或出错的回合不预测；发送中、输入框有内容或输入法组字时隐藏。
 - 预测正文到达时逐步显示；完成后按 `Tab`（或 `→`）把预测放入输入框，不会发送，可继续编辑。生成中不可接受，失败或取消时清除预览。
@@ -12,14 +13,16 @@ DeepSeek Harness 插件：参考 Codex 的输入预测，在一轮回复结束�
 
 ## 安装
 
-打开 DeepSeek Harness → **插件** → **添加插件**，填入以下任一地址并安装：
+打开 DeepSeek Harness → **插件** → **添加插件**，推荐使用以下版本地址：
 
 ```text
-https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.gz/refs/heads/main
+github:yjyang1990/dsh-input-prediction#v0.1.5
 ```
 
+也可使用固定版本的归档地址：
+
 ```text
-https://github.com/yjyang1990/dsh-input-prediction.git
+https://github.com/yjyang1990/dsh-input-prediction/archive/refs/tags/v0.1.5.tar.gz
 ```
 
 安装完成后点 **立即启用**，然后重启 DeepSeek Harness。
@@ -27,7 +30,7 @@ https://github.com/yjyang1990/dsh-input-prediction.git
 命令行安装：
 
 ```sh
-dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.gz/refs/heads/main
+dsh plugin add github:yjyang1990/dsh-input-prediction#v0.1.5
 ```
 
 ## 配置
@@ -36,7 +39,7 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 
 | 选项 | 说明 |
 | --- | --- |
-| 回复结束后显示输入预测 | 总开关，默认开启 |
+| 回复结束后显示输入预测 | 总开关，默认开启；会话还需单独开启预测 |
 | 预测模型 | 默认跟随当前会话；选择后同时保存 Provider 和模型 |
 | 预测失败时尝试会话模型 | 默认关闭。部分路由解析或服务商错误发生且尚无正文时，可尝试会话模型；其他错误、未知错误和超时不会触发。备用请求只发送真实用户消息、压缩摘要和助手回复，与同次预测的原请求共用超时；每轮（包括空闲补发）最多一次备用。可能跨 Provider 发送内容并产生额外费用。跟随会话模型、备用路由不可用或与所选路由相同时不回退 |
 | 推理强度 | 默认优先使用模型声明支持的 `none`，请求关闭推理；未提供 `none` 时使用首个支持的强度，没有强度列表时不指定。显式选择模型支持的强度时使用所选值 |
@@ -47,7 +50,7 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 
 旧配置只有 `predictionModel` 而没有 `predictionProvider` 时：优先使用当前会话 Provider 下的同名模型，否则使用唯一提供该模型的 Provider；有多个 Provider 提供时路由解析失败，可按上述开关选择是否尝试会话模型。任何需要查询的 Provider 模型目录查询失败时，由于无法确认唯一匹配，插件会停止而不猜测匹配，也不会因该未知错误触发回退。
 
-保存后无需重启，下一次回复结束时生效。配置保存在本机 profile 的 `cordis.patch.yml`。
+保存后无需重启，下一次回复结束时生效。配置保存在本机 profile 的 `cordis.patch.yml`。升级自旧版时，旧配置的默认开启状态不视为会话的明确选择；各会话默认关闭，请在需要的会话菜单中逐一开启。全局总开关与会话开关互相独立。
 
 ### OpenAI Responses 和 Chat Completions
 
@@ -75,7 +78,7 @@ dsh plugin add https://codeload.github.com/yjyang1990/dsh-input-prediction/tar.g
 
 `event=route_timing`、`context_timing`、`prepare_timing` 记录路由解析、上下文构造及调用准备耗时。`event=stream_summary` 分别记录模型返回的思考和正文增量次数及字符数、首个非空增量的相对耗时 `firstReasoningMs` / `firstTextMs` 和结束事件耗时 `finishMs`；未出现为 `null`。这些流内耗时从调用流开始计算，包括网络、服务商排队及生成，不能单独区分它们；字符数不等于 Token 数，且取决于 Provider 实际返回的增量类型。
 
-前端会将加载、接口访问、后端状态、展示条件及空闲补发的状态变化回传到 Host 日志，事件名分别为 `event=client_loaded`、`client_poll`、`client_backend`、`client_display` 和 `client_idle`。浏览器 Console 中也可搜索 `[dsh-input-prediction]`。重复状态不会反复记录；回传不包含会话 ID、输入或预测文本。
+会话开启预测后，前端会将加载、接口访问、后端状态、展示条件及空闲补发的状态变化回传到 Host 日志，事件名分别为 `event=client_loaded`、`client_poll`、`client_backend`、`client_display` 和 `client_idle`。浏览器 Console 中也可搜索 `[dsh-input-prediction]`。重复状态不会反复记录；回传不包含会话 ID、输入或预测文本。
 
 同一会话最新完成预测的状态接口也会在 `ready` 时返回 `reason`；它只保存最新状态，历史原因请查看日志。Host 日志是否写入磁盘取决于 DSH 配置，默认日志缓冲区保存在运行进程内。
 
@@ -97,7 +100,7 @@ pnpm test
 
 ## 更新
 
-在插件页卸载后重新安装即可获取最新版本。
+在插件页卸载后，使用新版本对应的安装地址重新安装。
 
 ## 许可
 

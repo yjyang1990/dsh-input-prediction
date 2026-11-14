@@ -90,6 +90,9 @@ function makeHost({ catalog = {}, reply = '{"suggestion":"继续运行测试"}',
     infos,
     routes,
     add(session) { lastSession = session.id; sessions.set(session.id, session); },
+    applyWithEnabledSessions(config = {}) {
+      apply(ctx, { ...config, enabledSessions: Object.fromEntries(Array.from(sessions.keys(), (id) => [id, true])) });
+    },
     // A live turn/end or explicit focus-idle request starts a prediction.
     end(session) { listeners["session/event"]?.(session, session.events.at(-1)); },
     emit: (name, ...args) => listeners[name]?.(...args),
@@ -124,6 +127,195 @@ async function settle(host, session) {
   throw new Error("prediction stayed pending");
 }
 
+test("per-session settings default off, persist, isolate sessions and cancel queued predictions", async () => {
+  const host = makeHost();
+  const first = makeSession();
+  const second = makeSession();
+  host.add(first);
+  host.add(second);
+  let persisted = { enabled: true, disabledSessions: { [first.id]: false, [second.id]: true } };
+  const config = {
+    enabled: { get: () => persisted.enabled },
+    enabledSessions: { get: () => persisted.enabledSessions ?? {} },
+  };
+  host.ctx.fiber = { entry: {} };
+  host.ctx.configEditor = { async edit(_entry, change) { persisted = change(persisted); } };
+  apply(host.ctx, config);
+  const route = host.routes.get("/api/dsh-input-prediction/session-setting");
+  const setting = async (sessionId, enabled) => (await route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId, enabled }),
+  }))).json();
+  const readSetting = async (sessionId) => (await route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting?sessionId=" + sessionId))).json();
+
+  assert.deepEqual(Config({}).enabledSessions.get(), {});
+  assert.deepEqual(await readSetting(first.id), { enabled: false });
+  assert.deepEqual(await readSetting(second.id), { enabled: false });
+  host.end(first);
+  host.end(second);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(await host.triggerFocusIdle(first.id), { status: "none" });
+  assert.deepEqual(await (await host.post({ sessionId: second.id })).json(), { status: "none" });
+  assert.equal(host.calls.length, 0);
+
+  assert.deepEqual(await setting(second.id, true), { enabled: true });
+  assert.deepEqual(persisted.enabledSessions, { [second.id]: true });
+  assert.deepEqual(await readSetting(first.id), { enabled: false });
+  assert.equal((await settle(host, second)).reason, "ok");
+
+  await setting(first.id, true);
+  host.end(first);
+  await setting(first.id, false);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(persisted.enabledSessions, { [second.id]: true, [first.id]: false });
+  assert.deepEqual(await host.triggerFocusIdle(first.id), { status: "none" });
+  assert.equal(host.calls.length, 1);
+  assert.equal((await host.poll(second.id)).reason, "ok");
+
+  await setting(first.id, true);
+  assert.equal((await settle(host, first)).reason, "ok");
+  await setting(second.id, false);
+  assert.deepEqual(await readSetting(first.id), { enabled: true });
+  assert.deepEqual(await readSetting(second.id), { enabled: false });
+  assert.deepEqual(await host.poll(second.id), { status: "none" });
+  assert.deepEqual(persisted.disabledSessions, { [first.id]: false, [second.id]: true });
+
+  persisted.enabled = false;
+  host.end(first);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(await host.triggerFocusIdle(first.id), { status: "none" });
+  assert.deepEqual(await host.poll(first.id), { status: "none" });
+  assert.deepEqual(await readSetting(first.id), { enabled: true });
+  assert.equal(host.calls.length, 2);
+  persisted.enabled = true;
+  host.dispose();
+
+  const restarted = makeHost();
+  const third = makeSession();
+  restarted.add(first);
+  restarted.add(second);
+  restarted.add(third);
+  apply(restarted.ctx, Config(JSON.parse(JSON.stringify(persisted))));
+  const restartedRoute = restarted.routes.get("/api/dsh-input-prediction/session-setting");
+  const restartedSetting = async (sessionId) => (await restartedRoute.fetch(new Request("http://local/api/dsh-input-prediction/session-setting?sessionId=" + sessionId))).json();
+  assert.deepEqual(await restartedSetting(first.id), { enabled: true });
+  assert.deepEqual(await restartedSetting(second.id), { enabled: false });
+  assert.deepEqual(await restartedSetting(third.id), { enabled: false });
+  assert.equal((await settle(restarted, first)).reason, "ok");
+  restarted.end(second);
+  restarted.end(third);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(await restarted.triggerFocusIdle(second.id), { status: "none" });
+  assert.deepEqual(await restarted.triggerFocusIdle(third.id), { status: "none" });
+  assert.equal(restarted.calls.length, 1);
+  restarted.dispose();
+});
+
+test("disabling a session aborts its in-flight prediction and persists across apply", async () => {
+  const host = makeHost({ stream: async function* () { await new Promise(() => {}); } });
+  const session = makeSession();
+  host.add(session);
+  let persisted = {};
+  const config = { enabledSessions: { get: () => persisted.enabledSessions ?? {} } };
+  host.ctx.fiber = { entry: {} };
+  host.ctx.configEditor = { async edit(_entry, change) { persisted = change(persisted); } };
+  apply(host.ctx, config);
+  const route = host.routes.get("/api/dsh-input-prediction/session-setting");
+  const setting = (enabled) => route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: session.id, enabled }),
+  }));
+  assert.equal((await setting(true)).status, 200);
+  host.end(session);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(host.calls.length, 1);
+  assert.equal((await setting(false)).status, 200);
+  assert.deepEqual(persisted.enabledSessions, { [session.id]: false });
+  assert.equal(host.calls[0].signal.aborted, true);
+  assert.deepEqual(await host.poll(), { status: "none" });
+  host.dispose();
+  const restarted = makeHost();
+  restarted.add(session);
+  apply(restarted.ctx, Config(JSON.parse(JSON.stringify(persisted))));
+  assert.deepEqual(await restarted.triggerFocusIdle(session.id), { status: "none" });
+  assert.equal(restarted.calls.length, 0);
+  restarted.dispose();
+});
+
+test("volatile global disable aborts pending work and clears cached and queued predictions", async () => {
+  let releasePending;
+  let streamCount = 0;
+  const host = makeHost({ stream: () => (async function* () {
+    if (++streamCount === 1) await new Promise((resolve) => { releasePending = resolve; });
+    yield { type: "text-delta", text: '{"suggestion":"旧预测"}' };
+    yield { type: "finish", reason: { kind: "stop" } };
+  })() });
+  const pending = makeSession();
+  const cached = makeSession();
+  const queued = makeSession();
+  for (const session of [pending, cached, queued]) host.add(session);
+  const current = { enabled: true, enabledSessions: Object.fromEntries([pending, cached, queued].map(({ id }) => [id, true])) };
+  const config = { enabled: { get: () => current.enabled }, enabledSessions: { get: () => current.enabledSessions } };
+  apply(host.ctx, config);
+
+  host.end(pending);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(host.calls.length, 1);
+  assert.equal((await settle(host, cached)).prediction, "旧预测");
+  host.end(queued);
+
+  current.enabled = false;
+  host.emit("loader/volatile-update", [["timeoutMs"]]);
+  assert.equal(host.calls[0].signal.aborted, false);
+  host.emit("loader/volatile-update", [["enabled"]]);
+  assert.equal(host.calls[0].signal.aborted, true);
+  current.enabled = true;
+  host.emit("loader/volatile-update", [["enabled"]]);
+  releasePending();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (const session of [pending, cached, queued]) {
+    assert.deepEqual(await host.poll(session.id), { status: "none" });
+  }
+  assert.equal(host.calls.length, 2);
+  host.dispose();
+});
+
+test("volatile session disable aborts only that session and discards a late result", async () => {
+  const releases = [];
+  const host = makeHost({ stream: () => (async function* () {
+    await new Promise((resolve) => releases.push(resolve));
+    yield { type: "text-delta", text: '{"suggestion":"后续预测"}' };
+    yield { type: "finish", reason: { kind: "stop" } };
+  })() });
+  const first = makeSession();
+  const second = makeSession();
+  const queued = makeSession();
+  host.add(queued);
+  host.add(first);
+  host.add(second);
+  const current = { enabledSessions: { [first.id]: true, [second.id]: true, [queued.id]: true } };
+  const config = { enabledSessions: { get: () => current.enabledSessions } };
+  apply(host.ctx, config);
+
+  host.end(first);
+  host.end(second);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(host.calls.length, 2);
+  host.end(queued);
+  current.enabledSessions = { [second.id]: true };
+  host.emit("loader/volatile-update", [["enabledSessions"]]);
+  assert.equal(host.calls[0].signal.aborted, true);
+  assert.equal(host.calls[1].signal.aborted, false);
+
+  current.enabledSessions = { [first.id]: true, [second.id]: true, [queued.id]: true };
+  host.emit("loader/volatile-update", [["enabledSessions"]]);
+  releases[0]();
+  releases[1]();
+  assert.equal((await settle(host)).prediction, "后续预测");
+  assert.deepEqual(await host.poll(first.id), { status: "none" });
+  assert.deepEqual(await host.poll(queued.id), { status: "none" });
+  assert.equal(host.calls.length, 2);
+  host.dispose();
+});
+
 test("timeout config and runtime stay within the timer limit", async () => {
   const max = 2147483647;
   assert.equal(Config({ timeoutMs: max }).timeoutMs.get(), max);
@@ -132,7 +324,7 @@ test("timeout config and runtime stay within the timer limit", async () => {
     const host = makeHost();
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { timeoutMs: configured });
+    host.applyWithEnabledSessions({ timeoutMs: configured });
     const state = await settle(host, session);
     assert.equal(state.reason, "ok");
     assert.ok(host.infos.some((line) => line.includes("timeoutMs=" + expected)));
@@ -153,7 +345,7 @@ test("streams only decoded suggestion prefixes across chunk boundaries", async (
   } });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx);
+  host.applyWithEnabledSessions();
   host.end(session);
   await new Promise((resolve) => setTimeout(resolve, 0));
   async function push(chunk, prediction) {
@@ -190,7 +382,7 @@ test("streams suggestion prefixes inside a split Markdown JSON fence", async () 
   } });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx);
+  host.applyWithEnabledSessions();
   host.end(session);
   await new Promise((resolve) => setTimeout(resolve, 0));
   for (const [chunk, prediction] of [
@@ -220,7 +412,7 @@ test("does not expose null or unrelated JSON while pending", async () => {
     } });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx);
+    host.applyWithEnabledSessions();
     host.end(session);
     await received;
     assert.equal((await host.poll()).prediction, "", text);
@@ -244,7 +436,7 @@ test("clears streamed prefixes on invalid output, failure, timeout and cancellat
     } });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { timeoutMs: outcome === "timeout" ? 30 : 30000 });
+    host.applyWithEnabledSessions({ timeoutMs: outcome === "timeout" ? 30 : 30000 });
     host.end(session);
     await received;
     assert.equal((await host.poll()).prediction, "草稿");
@@ -270,7 +462,7 @@ test("logs stage and stream timings without model content", async () => {
   } });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx);
+  host.applyWithEnabledSessions();
   const result = await settle(host, session);
   assert.equal(result.prediction, "private suggestion");
   for (const event of ["route_timing", "context_timing", "prepare_timing"]) {
@@ -286,7 +478,7 @@ test("another model gets only real user messages, summaries and assistant replie
   const session = makeSession();
   session.messages.splice(3, 0, userMessage("<compacted-summary>早先要求保留接口兼容</compacted-summary>", "compact-checkpoint"));
   host.add(session);
-  apply(host.ctx, { predictionModel: "small" });
+  host.applyWithEnabledSessions({ predictionModel: "small" });
 
   const state = await settle(host, session);
   assert.equal(state.prediction, "继续运行测试");
@@ -306,7 +498,7 @@ test("different model filters messages before applying the count limit", async (
     assistantMessage("latest reply"),
   ] });
   host.add(session);
-  apply(host.ctx, { predictionModel: "small" });
+  host.applyWithEnabledSessions({ predictionModel: "small" });
 
   await settle(host, session);
   const sent = host.calls[0].messages.slice(0, -1);
@@ -323,7 +515,7 @@ test("different model bounds an oversized latest message including text block se
     { role: "assistant", content: [ ...text("a".repeat(60000)), ...text("b".repeat(60000)) ] },
   ] });
   host.add(session);
-  apply(host.ctx, { predictionModel: "small" });
+  host.applyWithEnabledSessions({ predictionModel: "small" });
 
   await settle(host, session);
   const sent = host.calls[0].messages.slice(0, -1);
@@ -336,7 +528,7 @@ test("different model retains recent whole messages within the character limit",
   const host = makeHost({ catalog: { chat: ["big", "small"] } });
   const session = makeSession({ messages: [userMessage("x".repeat(50001)), assistantMessage("y".repeat(50000))] });
   host.add(session);
-  apply(host.ctx, { predictionModel: "small" });
+  host.applyWithEnabledSessions({ predictionModel: "small" });
 
   await settle(host, session);
   const sent = host.calls[0].messages.slice(0, -1);
@@ -348,7 +540,7 @@ test("uses an explicit provider and model", async () => {
   const host = makeHost({ catalog: { chat: ["big"], responses: ["small"] } });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { predictionProvider: "responses", predictionModel: "small" });
+  host.applyWithEnabledSessions({ predictionProvider: "responses", predictionModel: "small" });
 
   await settle(host, session);
   assert.equal(host.calls[0].config.provider, "responses");
@@ -368,7 +560,7 @@ test("routes predictions through explicitly selected OpenAI-compatible providers
     });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { predictionProvider: provider, predictionModel: "custom-model" });
+    host.applyWithEnabledSessions({ predictionProvider: provider, predictionModel: "custom-model" });
 
     const state = await settle(host, session);
     assert.equal(state.prediction, "继续运行测试");
@@ -381,7 +573,7 @@ test("finds the only provider offering a model configured without provider", asy
   const host = makeHost({ catalog: { chat: ["big"], responses: ["small"], other: ["x"] } });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { predictionModel: "small" });
+  host.applyWithEnabledSessions({ predictionModel: "small" });
 
   await settle(host, session);
   assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["responses", "small"]);
@@ -398,7 +590,7 @@ test("catalog failures never fall back for a model without a provider", async ()
       };
       const session = makeSession();
       host.add(session);
-      apply(host.ctx, { predictionModel: "small", fallbackToSession: true });
+      host.applyWithEnabledSessions({ predictionModel: "small", fallbackToSession: true });
       const state = await settle(host, session);
       assert.equal(state.reason, "provider_error");
       assert.equal(host.calls.length, 0);
@@ -412,7 +604,7 @@ test("prefers the session provider when it offers the configured model", async (
   const host = makeHost({ catalog: { chat: ["big", "small"], responses: ["small"] } });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { predictionModel: "small" });
+  host.applyWithEnabledSessions({ predictionModel: "small" });
 
   await settle(host, session);
   assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["chat", "small"]);
@@ -433,7 +625,7 @@ test("fallback shares the prediction deadline and respects cancellation", async 
     })() });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true, timeoutMs: 15 });
+    host.applyWithEnabledSessions({ predictionProvider: "other", predictionModel: "small", fallbackToSession: true, timeoutMs: 15 });
     host.end(session);
     while (!release) await new Promise((resolve) => setTimeout(resolve, 1));
     if (cancel) host.emit("session/event", session, { type: "turn/start" });
@@ -456,7 +648,7 @@ test("fallback inherits the remaining timeout instead of starting a new deadline
   })() });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true, timeoutMs: 50 });
+  host.applyWithEnabledSessions({ predictionProvider: "other", predictionModel: "small", fallbackToSession: true, timeoutMs: 50 });
   const state = await settle(host, session);
   assert.equal(state.reason, "timeout");
   assert.equal(host.calls.length, 2);
@@ -468,7 +660,7 @@ test("fallback is opt-in and route errors require a recognized code", async () =
     const host = makeHost({ resolveModel: () => { throw Object.assign(new Error("secret error"), { code }); } });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: enabled });
+    host.applyWithEnabledSessions({ predictionProvider: "other", predictionModel: "small", fallbackToSession: enabled });
     await settle(host, session);
     assert.equal(host.calls.length, expected);
     assert.ok(![...host.warnings, ...host.infos].join(" ").includes("secret error"));
@@ -483,7 +675,7 @@ test("provider fallback uses compact context and shares the per-turn stream budg
   const session = makeSession({ tools: [{ name: "secret-tool" }] });
   session.messages.at(-1).source = { kind: "model", provider: "chat", model: "big", replayState: { secret: "private replay" } };
   host.add(session);
-  apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
+  host.applyWithEnabledSessions({ predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
   await settle(host, session);
   assert.deepEqual(host.calls.map((call) => call.config.provider), ["other", "chat"]);
   const fallback = host.calls[1].options;
@@ -512,7 +704,7 @@ test("fallback requires a recognized failure before any text and a distinct rout
     })() });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { predictionProvider: provider, predictionModel: model, fallbackToSession: true });
+    host.applyWithEnabledSessions({ predictionProvider: provider, predictionModel: model, fallbackToSession: true });
     await settle(host, session);
     assert.equal(host.calls.length, expected, `${code}/${textDelta}/${provider}`);
   }
@@ -526,7 +718,7 @@ test("empty, declined, invalid and max-token responses do not trigger fallback",
     })() });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
+    host.applyWithEnabledSessions({ predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
     assert.equal((await settle(host, session)).reason, reason);
     assert.equal(host.calls.length, 1);
   }
@@ -541,7 +733,7 @@ test("recognized preparation errors fall back without spending a stream call", a
   };
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
+  host.applyWithEnabledSessions({ predictionProvider: "other", predictionModel: "small", fallbackToSession: true });
   await settle(host, session);
   assert.deepEqual(host.calls.map((call) => call.config.provider), ["chat"]);
 });
@@ -554,7 +746,7 @@ test("falls back to the session route when the configured model is unavailable o
     const host = makeHost({ catalog: { chat: ["big"], a: ["shared"], b: ["shared"], responses: ["small"] } });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, { ...config, fallbackToSession: true });
+    host.applyWithEnabledSessions({ ...config, fallbackToSession: true });
 
     await settle(host, session);
     assert.deepEqual([host.calls[0].config.provider, host.calls[0].config.model], ["chat", "big"]);
@@ -568,7 +760,7 @@ test("does not predict after interrupted or failed turns", async () => {
     const host = makeHost();
     const session = makeSession({ events: completedEvents(reason) });
     host.add(session);
-    apply(host.ctx, {});
+    host.applyWithEnabledSessions({});
 
     host.emit("session/event", session, session.events.at(-1));
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -581,7 +773,7 @@ test("predicts as soon as a completed turn ends", async () => {
   const host = makeHost();
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   host.emit("session/event", session, session.events.at(-1));
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -618,7 +810,7 @@ test("reads committed plan state through available host capabilities", async () 
       stateOf: () => { reads.push("stateOf"); },
     };
     host.add(session);
-    apply(host.ctx, {});
+    host.applyWithEnabledSessions({});
     await settle(host, session);
     assert.deepEqual(reads, [scenario.source], scenario.name);
     assert.equal(host.calls.length, scenario.active ? 0 : 1, scenario.name);
@@ -640,7 +832,7 @@ test("skips unknown plan state without calling the deprecated projection API", a
     host.ctx.get = (key) => ({ agents: { get: () => ({ session }) }, planMode: { get: scenario.service } })[key];
     host.ctx.sessionProjections = { snapshot: scenario.snapshot, stateOf: () => { legacyReads++; return { active: false }; } };
     host.add(session);
-    apply(host.ctx, {});
+    host.applyWithEnabledSessions({});
     await settle(host, session);
     assert.equal(legacyReads, 0, scenario.name);
     assert.equal(host.calls.length, scenario.calls, scenario.name);
@@ -658,7 +850,7 @@ test("logs why a completed turn is skipped", async () => {
     const host = makeHost();
     const session = makeSession(overrides);
     host.add(session);
-    apply(host.ctx, config);
+    host.applyWithEnabledSessions(config);
     host.end(session);
     await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(host.calls.length, 0);
@@ -677,13 +869,13 @@ test("unloading the plugin cancels scheduled and in-flight predictions without a
   const scheduled = makeSession();
   first.add(active);
   first.add(scheduled);
-  apply(first.ctx);
+  first.applyWithEnabledSessions();
   first.end(active);
   await streamStarted;
 
   const second = makeHost();
   second.add(active);
-  apply(second.ctx);
+  second.applyWithEnabledSessions();
   assert.equal((await settle(second, active)).prediction, "继续运行测试");
   first.end(scheduled);
   first.dispose();
@@ -697,7 +889,7 @@ test("disposing a session cancels scheduled turn-end predictions", async () => {
   const host = makeHost();
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   host.end(session);
   host.end(session);
@@ -717,7 +909,7 @@ test("disposing a session aborts its in-flight prediction", async () => {
   })() });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   host.end(session);
   await streamStarted;
@@ -733,7 +925,7 @@ test("starting another turn cancels a scheduled prediction", async () => {
   const host = makeHost();
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   host.end(session);
   host.emit("session/event", session, { type: "turn/start" });
@@ -745,7 +937,7 @@ test("starts a focus-idle fallback once and reuses the existing prediction", asy
   const host = makeHost();
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   await host.triggerFocusIdle();
   const state = await settle(host, session);
@@ -766,7 +958,7 @@ test("retries an empty prediction on focus-idle", async () => {
   });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   const first = await settle(host, session);
   assert.equal(first.prediction, "");
@@ -783,7 +975,7 @@ test("limits empty focus-idle predictions to one per completed turn", async () =
   const host = makeHost({ reply: '{"suggestion":null}' });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   await settle(host, session);
   await host.triggerFocusIdle();
@@ -820,7 +1012,7 @@ test("does not retry an empty focus-idle prediction when there was no initial pr
   const host = makeHost({ reply: '{"suggestion":null}' });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   await host.triggerFocusIdle();
   await settle(host);
@@ -836,7 +1028,7 @@ test("times out a provider that never answers", async () => {
   });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { timeoutMs: 20 });
+  host.applyWithEnabledSessions({ timeoutMs: 20 });
 
   const state = await settle(host, session);
   assert.deepEqual([state.status, state.prediction, state.reason], ["ready", "", "timeout"]);
@@ -849,7 +1041,7 @@ test("the session model replays the session's own request prefix for cache hits"
   const tools = [{ name: "bash", description: "run", parameters: {} }];
   const session = makeSession({ tools });
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   await settle(host, session);
   const { options } = host.calls[0];
@@ -871,7 +1063,7 @@ test("prefers none when supported and falls back to available efforts", async ()
     const host = makeHost({ efforts });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, {});
+    host.applyWithEnabledSessions({});
 
     await settle(host, session);
     assert.equal(host.calls[0].config.reasoningEffort, expected);
@@ -882,7 +1074,7 @@ test("uses a configured effort the model supports", async () => {
   const host = makeHost();
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { reasoningEffort: "low" });
+  host.applyWithEnabledSessions({ reasoningEffort: "low" });
 
   await settle(host, session);
   assert.equal(host.calls[0].config.reasoningEffort, "low");
@@ -892,7 +1084,7 @@ test("POST reads none without generating predictions, even with a query trigger"
   const host = makeHost();
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   const route = host.routes.get("/api/dsh-input-prediction");
   assert.deepEqual(route.methods, ["GET", "POST"]);
   assert.equal(route.requestBody, "buffered");
@@ -913,7 +1105,7 @@ test("POST reads the same ready prediction as GET without additional model calls
   const host = makeHost();
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   const ready = await settle(host, session);
   assert.deepEqual(ready, {
     status: "ready", completionSeq: 3, prediction: "继续运行测试", reason: "ok",
@@ -932,7 +1124,7 @@ test("POST never retries empty predictions while GET focus-idle retains its beha
   const host = makeHost({ reply: '{"suggestion":null}' });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   const ready = await settle(host, session);
   assert.equal(ready.reason, "model_declined");
 
@@ -949,7 +1141,7 @@ test("POST rejects invalid JSON, session ids and extra fields before session loo
   const host = makeHost();
   let lookups = 0;
   host.ctx.sessions.get = () => { lookups += 1; };
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   for (const body of [null, [], "s1", 1, true, {}, { sessionId: null }, { sessionId: 1 },
     { sessionId: [] }, { sessionId: {} }, { sessionId: "" }, { sessionId: " \t\n" },
     { sessionId: " s1" }, { sessionId: "s1 " }, { sessionId: "s1", trigger: "focus-idle" },
@@ -973,7 +1165,7 @@ test("POST rejects invalid JSON, session ids and extra fields before session loo
 test("opening an old session never calls the model", async () => {
   const host = makeHost();
   host.add(makeSession());
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
 
   for (let i = 0; i < 3; i += 1) assert.deepEqual(await host.poll(), { status: "none" });
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -989,7 +1181,7 @@ test("warns when the reply runs out of tokens", async () => {
   });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, { maxTokens: 8 });
+  host.applyWithEnabledSessions({ maxTokens: 8 });
 
   const state = await settle(host, session);
   assert.equal(state.prediction, "");
@@ -1015,7 +1207,7 @@ test("classifies model output through the registered endpoint", async () => {
     const host = makeHost({ reply });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, {});
+    host.applyWithEnabledSessions({});
     const state = await settle(host, session);
     assert.equal(state.status, "ready", reply);
     assert.equal(state.reason, reason, reply);
@@ -1037,7 +1229,7 @@ test("logs invalid JSON structure without exposing model output", async () => {
     })() });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx);
+    host.applyWithEnabledSessions();
     const state = await settle(host, session);
     assert.equal(state.reason, "max_tokens");
     assert.equal(state.prediction, "");
@@ -1058,7 +1250,7 @@ test("reports missing conversation context without calling the provider", async 
   const host = makeHost();
   const session = makeSession({ messages: [] });
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   const state = await settle(host, session);
   assert.deepEqual([state.status, state.prediction, state.reason], ["ready", "", "no_context"]);
   assert.equal(host.calls.length, 0);
@@ -1074,7 +1266,7 @@ test("classifies provider failures without exposing their contents", async () =>
     const host = makeHost({ stream });
     const session = makeSession();
     host.add(session);
-    apply(host.ctx, {});
+    host.applyWithEnabledSessions({});
     const state = await settle(host, session);
     assert.equal(state.reason, "provider_error");
     assert.equal(state.prediction, "");
@@ -1091,7 +1283,7 @@ test("counts reasoning and text deltas without logging their contents", async ()
   })() });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   assert.equal((await settle(host, session)).prediction, "继续");
   const logs = [...host.infos, ...host.warnings].join("\n");
   assert.match(logs, /reasoningDeltas=2 reasoningChars=4 textDeltas=1 textChars=19 finishReason=stop/);
@@ -1100,7 +1292,7 @@ test("counts reasoning and text deltas without logging their contents", async ()
 
 test("diagnostics validates and logs only allowlisted client state", async () => {
   const host = makeHost();
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   const route = host.routes.get("/api/dsh-input-prediction/diagnostics");
   assert.deepEqual(route.methods, ["POST"]);
   assert.equal(route.requestBody, "buffered");
@@ -1133,7 +1325,7 @@ test("reports max tokens while preserving a complete parsed suggestion", async (
   })() });
   const session = makeSession();
   host.add(session);
-  apply(host.ctx, {});
+  host.applyWithEnabledSessions({});
   const state = await settle(host, session);
   assert.equal(state.reason, "max_tokens");
   assert.equal(state.prediction, "继续");
