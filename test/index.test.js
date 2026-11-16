@@ -952,7 +952,7 @@ test("retries an empty prediction on focus-idle", async () => {
   const host = makeHost({
     stream: () => (async function* () {
       attempts += 1;
-      yield { type: "text-delta", text: attempts === 1 ? '{"suggestion":null}' : '{"suggestion":"继续运行测试"}' };
+      yield { type: "text-delta", text: attempts === 1 ? "" : '{"suggestion":"继续运行测试"}' };
       yield { type: "finish", reason: { kind: "stop" } };
     })(),
   });
@@ -962,8 +962,8 @@ test("retries an empty prediction on focus-idle", async () => {
 
   const first = await settle(host, session);
   assert.equal(first.prediction, "");
-  assert.equal(first.reason, "model_declined");
-  assert.match(host.warnings.join("\n"), /result=model_declined trigger=turn-end completionSeq=/);
+  assert.equal(first.reason, "empty_output");
+  assert.match(host.warnings.join("\n"), /result=empty_output trigger=turn-end completionSeq=/);
   await host.triggerFocusIdle();
   const second = await settle(host, session);
   assert.equal(second.prediction, "继续运行测试");
@@ -971,8 +971,24 @@ test("retries an empty prediction on focus-idle", async () => {
   assert.equal(host.calls.length, 2);
 });
 
-test("limits empty focus-idle predictions to one per completed turn", async () => {
+test("does not retry an intentional null prediction on focus-idle", async () => {
   const host = makeHost({ reply: '{"suggestion":null}' });
+  const session = makeSession();
+  host.add(session);
+  host.applyWithEnabledSessions({});
+
+  const ready = await settle(host, session);
+  assert.equal(ready.reason, "model_declined");
+  assert.equal(ready.prediction, "");
+  await host.triggerFocusIdle();
+  assert.deepEqual(await settle(host), ready);
+  await host.triggerFocusIdle();
+  assert.deepEqual(await settle(host), ready);
+  assert.equal(host.calls.length, 1);
+});
+
+test("limits empty focus-idle predictions to one per completed turn", async () => {
+  const host = makeHost({ reply: "" });
   const session = makeSession();
   host.add(session);
   host.applyWithEnabledSessions({});
@@ -991,7 +1007,7 @@ test("limits empty focus-idle predictions to one per completed turn", async () =
   assert.match(starts[0], new RegExp(`flow=${firstFlow} attempt=1 trigger=turn-end`));
   assert.match(starts[1], new RegExp(`flow=${firstFlow} attempt=2 trigger=focus-idle`));
   assert.equal(host.infos.filter((line) => line.includes("event=retry_suppressed")).length, 1);
-  assert.match(host.warnings.join("\n"), /result=model_declined.*elapsedMs=\d+/);
+  assert.match(host.warnings.join("\n"), /result=empty_output.*elapsedMs=\d+/);
   const logs = [...host.infos, ...host.warnings].join("\n");
   assert.doesNotMatch(logs, /帮我把默认错误码改成|已修改，还没有运行测试|suggestion|s\d+\b/);
 
@@ -1049,8 +1065,8 @@ test("the session model replays the session's own request prefix for cache hits"
   assert.deepEqual(options.tools, tools);
   assert.deepEqual(options.toolHistory, { tools, updates: [] });
   assert.match(options.messages.at(-1).content[0].text, /Recommend the next concrete request/);
-  assert.match(options.messages.at(-1).content[0].text, /Always suggest one non-empty/);
-  assert.match(options.messages.at(-1).content[0].text, /"suggestion":\{"type":"string","minLength":1\}/);
+  assert.match(options.messages.at(-1).content[0].text, /explicitly ends the current task and explicitly asks for no further suggestions/);
+  assert.match(options.messages.at(-1).content[0].text, /"suggestion":\{"type":\["string","null"\],"minLength":1\}/);
   assert.match(options.messages.at(-1).content[0].text, /"additionalProperties":false/);
 });
 
@@ -1121,12 +1137,12 @@ test("POST reads the same ready prediction as GET without additional model calls
 });
 
 test("POST never retries empty predictions while GET focus-idle retains its behavior", async () => {
-  const host = makeHost({ reply: '{"suggestion":null}' });
+  const host = makeHost({ reply: "" });
   const session = makeSession();
   host.add(session);
   host.applyWithEnabledSessions({});
   const ready = await settle(host, session);
-  assert.equal(ready.reason, "model_declined");
+  assert.equal(ready.reason, "empty_output");
 
   for (let i = 0; i < 3; i += 1) {
     assert.deepEqual(await (await host.post({ sessionId: session.id }, "?trigger=focus-idle")).json(), ready);
