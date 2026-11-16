@@ -4,6 +4,8 @@
       config:
         # Same switch as Codex's composer-predictions-enabled (default on).
         enabled: true
+        # Apply the global switch to every session and hide session menu controls.
+        forceEnabled: false
         # Provider + model for predictions; empty = the session's own route.
         # A model without provider uses the session provider, else the only provider offering it.
         predictionProvider: ''

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createRequire } from "node:module";
 import { apply, Config } from "../lib/index.js";
 
 const text = (value) => [{ type: "text", text: value }];
@@ -127,6 +128,216 @@ async function settle(host, session) {
   throw new Error("prediction stayed pending");
 }
 
+test("force mode applies the global switch and preserves session settings", async () => {
+  const host = makeHost();
+  const first = makeSession();
+  const second = makeSession();
+  host.add(first);
+  host.add(second);
+  let persisted = { enabled: true, forceEnabled: false, enabledSessions: { [first.id]: true } };
+  const config = {
+    enabled: { get: () => persisted.enabled },
+    forceEnabled: { get: () => persisted.forceEnabled },
+    enabledSessions: { get: () => persisted.enabledSessions },
+  };
+  host.ctx.fiber = { entry: {} };
+  host.ctx.configEditor = { async edit(_entry, change) { persisted = change(persisted); } };
+  apply(host.ctx, config);
+  const route = host.routes.get("/api/dsh-input-prediction/session-setting");
+  const get = async (id) => (await route.fetch(new Request(`http://local/api/dsh-input-prediction/session-setting?sessionId=${id}`))).json();
+  assert.equal(Config({}).forceEnabled.get(), false);
+  assert.deepEqual(await get(second.id), { enabled: false, forceEnabled: false, globalEnabled: true });
+  persisted.forceEnabled = true;
+  host.emit("loader/volatile-update", [["forceEnabled"]]);
+  assert.deepEqual(await get(second.id), { enabled: true, forceEnabled: true, globalEnabled: true });
+  assert.equal((await settle(host, second)).reason, "ok");
+  const response = await route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: second.id, enabled: false }),
+  }));
+  assert.deepEqual(await response.json(), { enabled: true, forceEnabled: true });
+  assert.deepEqual(persisted.enabledSessions, { [first.id]: true });
+  persisted.enabled = false;
+  host.emit("loader/volatile-update", [["enabled"]]);
+  assert.deepEqual(await get(second.id), { enabled: true, forceEnabled: true, globalEnabled: false });
+  assert.deepEqual(await host.poll(second.id), { status: "none" });
+  persisted.enabled = true;
+  persisted.forceEnabled = false;
+  host.emit("loader/volatile-update", [["forceEnabled"]]);
+  assert.deepEqual(await get(first.id), { enabled: true, forceEnabled: false, globalEnabled: true });
+  assert.deepEqual(await get(second.id), { enabled: false, forceEnabled: false, globalEnabled: true });
+  host.dispose();
+});
+
+test("serializes force and session changes in both orders", async () => {
+  for (const layer of ["override", "inherited"]) {
+    for (const first of ["force", "session"]) {
+      const host = makeHost();
+      const session = makeSession();
+      host.add(session);
+      let inherited = { enabled: true, forceEnabled: false, enabledSessions: { [session.id]: true } };
+      let persisted = layer === "override" ? { ...inherited } : undefined;
+      const effective = () => persisted ?? inherited;
+      const config = {
+        enabled: { get: () => effective().enabled },
+        forceEnabled: { get: () => effective().forceEnabled ?? false },
+        enabledSessions: { get: () => effective().enabledSessions },
+      };
+      let releaseFirst;
+      const firstMayFinish = new Promise((resolve) => { releaseFirst = resolve; });
+      let signalFirst;
+      const firstStarted = new Promise((resolve) => { signalFirst = resolve; });
+      let signalSessionQueued;
+      const sessionQueued = new Promise((resolve) => { signalSessionQueued = resolve; });
+      let queue = Promise.resolve();
+      const events = [];
+      const enqueue = (operation) => {
+        const result = queue.then(operation);
+        queue = result;
+        return result;
+      };
+      host.ctx.fiber = { entry: {} };
+      host.ctx.configEditor = { edit(_entry, change) {
+        signalSessionQueued();
+        return enqueue(async () => {
+          const current = effective();
+          const next = change(current, inherited);
+          if (next !== current) {
+            persisted = next;
+            events.push("session");
+            host.emit("loader/volatile-update", [["enabledSessions"]]);
+          }
+          if (first === "session") {
+            signalFirst();
+            await firstMayFinish;
+          }
+        });
+      } };
+      apply(host.ctx, config);
+      const ready = await settle(host, session);
+      const route = host.routes.get("/api/dsh-input-prediction/session-setting");
+      const saveSession = () => route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: session.id, enabled: false }),
+      }));
+      const saveForce = () => enqueue(async () => {
+        if (first === "force") {
+          signalFirst();
+          await firstMayFinish;
+        }
+        if (persisted) persisted = { ...persisted, forceEnabled: true };
+        else inherited = { ...inherited, forceEnabled: true };
+        events.push("force");
+        host.emit("loader/volatile-update", [["forceEnabled"]]);
+      });
+      let savingSession;
+      let savingForce;
+      if (first === "force") {
+        savingForce = saveForce();
+        await firstStarted;
+        savingSession = saveSession();
+        await sessionQueued;
+        assert.deepEqual(await host.poll(session.id), ready, layer);
+      } else {
+        savingSession = saveSession();
+        await firstStarted;
+        assert.deepEqual(await host.poll(session.id), { status: "none" }, layer);
+        savingForce = saveForce();
+      }
+      releaseFirst();
+      const [response] = await Promise.all([savingSession, savingForce]);
+      assert.equal(response.status, 200, layer);
+      assert.deepEqual(events, first === "force" ? ["force"] : ["session", "force"], layer);
+      assert.equal(effective().enabledSessions[session.id], first === "force", layer);
+      assert.deepEqual(await host.poll(session.id), first === "force" ? ready : { status: "none" }, layer);
+      assert.equal((await (await route.fetch(new Request(
+        "http://local/api/dsh-input-prediction/session-setting?sessionId=" + session.id,
+      ))).json()).forceEnabled, true, layer);
+      if (first === "session") {
+        await host.triggerFocusIdle(session.id);
+        assert.equal((await settle(host)).reason, "ok", layer);
+      }
+      await enqueue(async () => {
+        if (persisted) persisted = { ...persisted, forceEnabled: false };
+        else inherited = { ...inherited, forceEnabled: false };
+        host.emit("loader/volatile-update", [["forceEnabled"]]);
+      });
+      const setting = await route.fetch(new Request(
+        "http://local/api/dsh-input-prediction/session-setting?sessionId=" + session.id,
+      ));
+      assert.deepEqual(await setting.json(), { enabled: first === "force", forceEnabled: false, globalEnabled: true }, layer);
+      assert.deepEqual(await host.poll(session.id), first === "force" ? ready : { status: "none" }, layer);
+      host.dispose();
+    }
+  }
+});
+
+test("session settings use the effective config instead of inherited fields", async () => {
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  let current = { enabled: true, enabledSessions: {} };
+  const inherited = { enabled: true, forceEnabled: true };
+  const config = {
+    enabled: { get: () => current.enabled },
+    forceEnabled: { get: () => current.forceEnabled ?? false },
+    enabledSessions: { get: () => current.enabledSessions },
+  };
+  host.ctx.fiber = { entry: {} };
+  host.ctx.configEditor = { async edit(_entry, change) { current = change(current, inherited); } };
+  apply(host.ctx, config);
+  const route = host.routes.get("/api/dsh-input-prediction/session-setting");
+  const response = await route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: session.id, enabled: true }),
+  }));
+  assert.deepEqual(await response.json(), { enabled: true, forceEnabled: false });
+  assert.equal(current.enabledSessions[session.id], true);
+  host.dispose();
+});
+
+test("session settings follow the host's whole-config composition", async (t) => {
+  let composeEntries;
+  try {
+    const require = createRequire(process.env.DSH_INSTALL_DIR
+      ? process.env.DSH_INSTALL_DIR + "/package.json" : import.meta.url);
+    ({ composeEntries } = await import(require.resolve("@deepseek-ai/dsh-app-boot")));
+  } catch (error) {
+    if (error.code !== "MODULE_NOT_FOUND") throw error;
+    t.skip("dsh-app-boot is not installed in this environment");
+    return;
+  }
+  const host = makeHost();
+  const session = makeSession();
+  host.add(session);
+  const base = [{ insert: [{ id: "prediction", name: "prediction", config: { forceEnabled: true, enabled: true } }] }];
+  let override = { enabled: true };
+  const current = () => composeEntries([base, [{ id: "prediction", config: override }]])[0].config;
+  const config = {
+    enabled: { get: () => Config(current()).enabled.get() },
+    forceEnabled: { get: () => Config(current()).forceEnabled.get() },
+    enabledSessions: { get: () => Config(current()).enabledSessions.get() },
+  };
+  host.ctx.fiber = { entry: {} };
+  host.ctx.configEditor = { async edit(_entry, change) { override = change(current(), base[0].insert[0].config); } };
+  apply(host.ctx, config);
+  const route = host.routes.get("/api/dsh-input-prediction/session-setting");
+  const get = async () => (await route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting?sessionId=" + session.id))).json();
+  const save = async (enabled) => (await route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: session.id, enabled }),
+  }))).json();
+  assert.equal(current().forceEnabled, undefined);
+  assert.deepEqual(await get(), { enabled: false, forceEnabled: false, globalEnabled: true });
+  assert.deepEqual(await save(true), { enabled: true, forceEnabled: false });
+  assert.deepEqual(current().enabledSessions, { [session.id]: true });
+  assert.deepEqual(await save(false), { enabled: false, forceEnabled: false });
+  assert.deepEqual(current().enabledSessions, { [session.id]: false });
+  override = { enabled: true, forceEnabled: true, enabledSessions: { [session.id]: false } };
+  assert.deepEqual(await save(true), { enabled: true, forceEnabled: true });
+  assert.deepEqual(current().enabledSessions, { [session.id]: false });
+  host.dispose();
+});
+
 test("per-session settings default off, persist, isolate sessions and cancel queued predictions", async () => {
   const host = makeHost();
   const first = makeSession();
@@ -148,8 +359,8 @@ test("per-session settings default off, persist, isolate sessions and cancel que
   const readSetting = async (sessionId) => (await route.fetch(new Request("http://local/api/dsh-input-prediction/session-setting?sessionId=" + sessionId))).json();
 
   assert.deepEqual(Config({}).enabledSessions.get(), {});
-  assert.deepEqual(await readSetting(first.id), { enabled: false });
-  assert.deepEqual(await readSetting(second.id), { enabled: false });
+  assert.deepEqual(await readSetting(first.id), { enabled: false, forceEnabled: false, globalEnabled: true });
+  assert.deepEqual(await readSetting(second.id), { enabled: false, forceEnabled: false, globalEnabled: true });
   host.end(first);
   host.end(second);
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -157,9 +368,9 @@ test("per-session settings default off, persist, isolate sessions and cancel que
   assert.deepEqual(await (await host.post({ sessionId: second.id })).json(), { status: "none" });
   assert.equal(host.calls.length, 0);
 
-  assert.deepEqual(await setting(second.id, true), { enabled: true });
+  assert.deepEqual(await setting(second.id, true), { enabled: true, forceEnabled: false });
   assert.deepEqual(persisted.enabledSessions, { [second.id]: true });
-  assert.deepEqual(await readSetting(first.id), { enabled: false });
+  assert.deepEqual(await readSetting(first.id), { enabled: false, forceEnabled: false, globalEnabled: true });
   assert.equal((await settle(host, second)).reason, "ok");
 
   await setting(first.id, true);
@@ -174,8 +385,8 @@ test("per-session settings default off, persist, isolate sessions and cancel que
   await setting(first.id, true);
   assert.equal((await settle(host, first)).reason, "ok");
   await setting(second.id, false);
-  assert.deepEqual(await readSetting(first.id), { enabled: true });
-  assert.deepEqual(await readSetting(second.id), { enabled: false });
+  assert.deepEqual(await readSetting(first.id), { enabled: true, forceEnabled: false, globalEnabled: true });
+  assert.deepEqual(await readSetting(second.id), { enabled: false, forceEnabled: false, globalEnabled: true });
   assert.deepEqual(await host.poll(second.id), { status: "none" });
   assert.deepEqual(persisted.disabledSessions, { [first.id]: false, [second.id]: true });
 
@@ -184,7 +395,7 @@ test("per-session settings default off, persist, isolate sessions and cancel que
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(await host.triggerFocusIdle(first.id), { status: "none" });
   assert.deepEqual(await host.poll(first.id), { status: "none" });
-  assert.deepEqual(await readSetting(first.id), { enabled: true });
+  assert.deepEqual(await readSetting(first.id), { enabled: true, forceEnabled: false, globalEnabled: false });
   assert.equal(host.calls.length, 2);
   persisted.enabled = true;
   host.dispose();
@@ -197,9 +408,9 @@ test("per-session settings default off, persist, isolate sessions and cancel que
   apply(restarted.ctx, Config(JSON.parse(JSON.stringify(persisted))));
   const restartedRoute = restarted.routes.get("/api/dsh-input-prediction/session-setting");
   const restartedSetting = async (sessionId) => (await restartedRoute.fetch(new Request("http://local/api/dsh-input-prediction/session-setting?sessionId=" + sessionId))).json();
-  assert.deepEqual(await restartedSetting(first.id), { enabled: true });
-  assert.deepEqual(await restartedSetting(second.id), { enabled: false });
-  assert.deepEqual(await restartedSetting(third.id), { enabled: false });
+  assert.deepEqual(await restartedSetting(first.id), { enabled: true, forceEnabled: false, globalEnabled: true });
+  assert.deepEqual(await restartedSetting(second.id), { enabled: false, forceEnabled: false, globalEnabled: true });
+  assert.deepEqual(await restartedSetting(third.id), { enabled: false, forceEnabled: false, globalEnabled: true });
   assert.equal((await settle(restarted, first)).reason, "ok");
   restarted.end(second);
   restarted.end(third);

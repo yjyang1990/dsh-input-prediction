@@ -115,8 +115,139 @@ function trackedChannels() {
   return { channels, TestChannel };
 }
 
+test('force setting defaults off and is saved in plugin configuration', async () => {
+  let snapshot = { status: 'ready', writable: true, revision: 1, value: {} };
+  let operations;
+  const scope = {
+    subscribe: () => () => {},
+    getSnapshot: () => snapshot,
+    async mutate(changes) {
+      operations = changes;
+      snapshot = { ...snapshot, value: Object.fromEntries(changes.map((change) => [change.path[0], change.value])) };
+      return true;
+    },
+  };
+  const client = createClient({ configScope: scope });
+  let tree = client.render();
+  let checkbox = tree.children.find((child) => child?.type === 'label' && child.children.includes('所有会话强制使用全局开关')).children[0];
+  assert.equal(checkbox.props.checked, false);
+  checkbox.props.onChange({ target: { checked: true } });
+  tree = client.render();
+  await tree.children.find((child) => child?.props?.className === 'dship-actions').children[0].props.onClick();
+  assert.equal(operations.find((change) => change.path[0] === 'forceEnabled').value, true);
+  tree = client.render();
+  checkbox = tree.children.find((child) => child?.type === 'label' && child.children.includes('所有会话强制使用全局开关')).children[0];
+  assert.equal(checkbox.props.checked, true);
+});
+
+test('global force changes refresh active prediction and open native and bot menus', async () => {
+  let snapshot = { status: 'ready', writable: true, revision: 1, value: { enabled: true, forceEnabled: false } };
+  const listeners = new Set();
+  const scope = {
+    getSnapshot: () => snapshot,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+  };
+  const setConfig = (patch) => {
+    snapshot = { ...snapshot, value: { ...snapshot.value, ...patch } };
+    for (const listener of listeners) listener();
+  };
+  const client = createClient({ configScope: scope, configView: false, settingEnabled: false,
+    getSessionSetting: () => ({ forceEnabled: snapshot.value.forceEnabled,
+      enabled: snapshot.value.forceEnabled, globalEnabled: snapshot.value.enabled }) });
+  client.render();
+  await client.settle();
+  const native = client.openMenu('session', 'first');
+  const bot = client.openMenu('ds-bot.session', 'first');
+  await Promise.all([native.ready, bot.ready]);
+  const staleAction = native.actions[0];
+  assert.equal(staleAction.label, '输入预测：已关闭');
+  assert.equal(client.requests.length, 0);
+
+  setConfig({ forceEnabled: true });
+  await Promise.all([native.ready, bot.ready]);
+  await client.settle();
+  assert.equal(native.actions.length, 0);
+  assert.equal(bot.actions.length, 0);
+  assert.equal(client.requests.length, 1);
+  await staleAction.run();
+  assert.equal(client.settingRequests.filter((request) => request.options?.method === 'POST').length, 0);
+
+  setConfig({ enabled: false });
+  await Promise.all([native.ready, bot.ready]);
+  await client.settle();
+  assert.equal(client.requests[0].options.signal.aborted, true);
+  assert.equal(native.actions.length, 0);
+  assert.equal(bot.actions.length, 0);
+
+  setConfig({ enabled: true, forceEnabled: false });
+  await Promise.all([native.ready, bot.ready]);
+  await client.settle();
+  assert.equal(native.actions[0].label, '输入预测：已关闭');
+  assert.equal(bot.actions[0].label, '输入预测：已关闭');
+  assert.equal(client.requests.length, 1);
+  client.unmount();
+});
+
+test('global force changes refresh another window through broadcast', { timeout: 3000 }, async () => {
+  const { channels, TestChannel } = trackedChannels();
+  let snapshot = { status: 'ready', value: { enabled: true, forceEnabled: false } };
+  const listeners = new Set();
+  const scope = { getSnapshot: () => snapshot, subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); } };
+  const readSetting = () => ({ enabled: snapshot.value.forceEnabled, forceEnabled: snapshot.value.forceEnabled, globalEnabled: snapshot.value.enabled });
+  const first = createClient({ configScope: scope, configView: false, broadcastChannel: TestChannel, getSessionSetting: readSetting });
+  const second = createClient({ broadcastChannel: TestChannel, getSessionSetting: readSetting });
+  try {
+    first.render();
+    second.render();
+    await second.settle();
+    const menu = second.openMenu('ds-bot.session', 'first');
+    await menu.ready;
+    assert.equal(menu.actions[0].label, '输入预测：已关闭');
+    const received = channels[1].nextMessage();
+    snapshot = { ...snapshot, value: { enabled: true, forceEnabled: true } };
+    for (const listener of listeners) listener();
+    await received;
+    await menu.ready;
+    await second.settle();
+    assert.equal(menu.actions.length, 0);
+    assert.equal(second.requests.length, 1);
+
+    const disabled = channels[1].nextMessage();
+    snapshot = { ...snapshot, value: { enabled: false, forceEnabled: true } };
+    for (const listener of listeners) listener();
+    await disabled;
+    await second.settle();
+    assert.equal(second.requests[0].options.signal.aborted, true);
+    assert.equal(second.requests.length, 1);
+
+    const enabled = channels[1].nextMessage();
+    snapshot = { ...snapshot, value: { enabled: true, forceEnabled: true } };
+    for (const listener of listeners) listener();
+    await enabled;
+    await second.settle();
+    assert.equal(second.requests.length, 2);
+  } finally {
+    first.unmount();
+    second.unmount();
+  }
+});
+
+test('a window without config services respects an already disabled global switch', async () => {
+  for (const forceEnabled of [false, true]) {
+    const client = createClient({ getSessionSetting: () => ({ enabled: true, forceEnabled, globalEnabled: false }) });
+    try {
+      client.render();
+      await client.settle();
+      assert.equal(client.requests.length, 0);
+    } finally {
+      client.unmount();
+    }
+  }
+});
+
 function createClient({ lineTop = null, configScope = null, visibilityState = 'visible', reenterVisibility = false,
-  settingEnabled = true, deferSettings = false, deferSettingPost = false, failSettingPost = false, broadcastChannel, sharedSettings } = {}) {
+  settingEnabled = true, deferSettings = false, deferSettingPost = false, failSettingPost = false, broadcastChannel, sharedSettings,
+  getSessionSetting, configView = true } = {}) {
   const hooks = [];
   const listeners = new Map();
   const intervals = new Map();
@@ -220,8 +351,8 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
         callback({
           configForms: { get: () => configScope, whileServed: (_names, register) => register() },
           remote: { session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) }, $on: () => () => {} },
-          effect: (fn) => fn(),
-          slots: { inject(_name, register) { register(); }, register(_options, value) { component = value; } },
+          effect(fn) { const cleanup = fn(); if (typeof cleanup === 'function') pluginCleanups.push(cleanup); },
+          slots: { inject(_name, register) { if (configView) register(); }, register(_options, value) { component = value; } },
         });
       },
     });
@@ -248,7 +379,8 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
         if (deferSettings) return result.promise;
         const sessionId = new URL(url, 'http://localhost').searchParams.get('sessionId');
         const immediate = (value) => ({ then: (fn) => immediate(fn(value)), catch() { return this; } });
-        return immediate({ ok: true, json: () => ({ enabled: settings.get(sessionId) ?? settingEnabled }) });
+        return immediate({ ok: true, json: () => getSessionSetting
+          ? getSessionSetting(sessionId) : ({ enabled: settings.get(sessionId) ?? settingEnabled }) });
       }
       const result = deferred();
       requests.push({ url, options, ...result });
@@ -270,8 +402,8 @@ function createClient({ lineTop = null, configScope = null, visibilityState = 'v
       dirty = false;
       cursor = 0;
       pending = [];
-      tree = component(configScope ? { view: 'page' } : props);
-      if (configScope) tree = tree.type(tree.props);
+      tree = component(configScope && configView ? { view: 'page' } : props);
+      if (configScope && configView) tree = tree.type(tree.props);
       const effects = pending;
       pending = [];
       effects.forEach((effect) => effect());
