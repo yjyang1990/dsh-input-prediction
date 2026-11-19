@@ -131,7 +131,7 @@ for (const [api, fallback] of [["openai-completions", false], ["openai-responses
     const serialized = JSON.stringify(requests[0].body);
     assert.match(serialized, /帮我修改代码/);
     assert.match(serialized, /已修改/);
-    assert.match(serialized, /Recommend the next concrete request/);
+    assert.match(serialized, /You draft the user's next request to the AI/);
     if (fallback) {
       assert.deepEqual(attempts, ["missing", "fixture"]);
       assert.deepEqual(errors, ["MISSING_CREDENTIAL"]);

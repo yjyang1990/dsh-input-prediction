@@ -1275,8 +1275,8 @@ test("the session model replays the session's own request prefix for cache hits"
   assert.deepEqual(options.messages.slice(0, -1), session.messages);
   assert.deepEqual(options.tools, tools);
   assert.deepEqual(options.toolHistory, { tools, updates: [] });
-  assert.match(options.messages.at(-1).content[0].text, /Recommend the next concrete request/);
-  assert.match(options.messages.at(-1).content[0].text, /explicitly ends the current task and explicitly asks for no further suggestions/);
+  assert.match(options.messages.at(-1).content[0].text, /You draft the user's next request to the AI/);
+  assert.match(options.messages.at(-1).content[0].text, /explicitly ends the task and explicitly asks for no further suggestions/);
   assert.match(options.messages.at(-1).content[0].text, /"suggestion":\{"type":\["string","null"\],"minLength":1\}/);
   assert.match(options.messages.at(-1).content[0].text, /"additionalProperties":false/);
 });

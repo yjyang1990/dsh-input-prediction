@@ -36,7 +36,7 @@ export async function createLlm() { return {
     assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'user']);
     assert.equal(messages[0].content[0].text, `task ${index ? 'two' : 'one'}`);
     assert.deepEqual(messages[1].source, { kind: 'model', provider: 'synthetic', model: 'synthetic' });
-    assert.match(messages[2].content[0].text, /Recommend the next concrete request/);
+    assert.match(messages[2].content[0].text, /You draft the user's next request to the AI/);
     assert.doesNotMatch(JSON.stringify(messages), /must remain hidden/);
   }
 });
